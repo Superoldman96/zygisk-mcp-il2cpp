@@ -1,0 +1,21 @@
+{
+  "features": {
+    "connection": true,
+    "ui": true,
+    "il2cpp_metadata": true,
+    "il2cpp_invoke": true,
+    "il2cpp_objects": true,
+    "il2cpp_hook": true,
+    "memory_maps": true,
+    "memory_read": true,
+    "memory_write": true,
+    "memory_search": true,
+    "pointer_chain": true,
+    "dobby": true,
+    "trace": true,
+    "lua": true,
+    "assembly": true,
+    "breakpoint": true,
+    "diagnostics": true
+  }
+}

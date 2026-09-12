@@ -18,6 +18,9 @@ python mcp/mcp_server.py --port 27184 --direct
 
 默认模式会先连接本机 `127.0.0.1:27184`，失败后再尝试 `adb forward`；`--direct` 会禁用自动转发。
 
+仅在建立连接失败时自动转发并重试；连接后发生超时/断开不会自动重放命令。目标重启后需重新解析运行时地址。
+
+
 MCP 还会启动独立的浏览器控制页面，默认地址是 `http://127.0.0.1:27185/`。所有功能开关第一次启动时全部开启，页面修改会立即影响 `tools/list` 并保存到 `mcp_features.json`。可用参数：
 
 ```text
@@ -104,13 +107,43 @@ adb forward tcp:<port> tcp:<port>
 
 Flags 枚举成员可用 `|` 组合，例如 `{"enum":"Read|Write"}`。枚举返回值按其底层整数类型返回。
 
-Dump 文件固定保存到目标应用的：
+`il2cpp_dump_file` 可选 `image / namespace / class_name` 精确过滤（`namespace: ""` 选择全局空间）；不传参数导出全量。Dump 文件保存到目标应用的：
 
 ```text
-files/zygisk_il2cpp_mcp/il2cpp_dump.cs
+files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 ```
 
-对应 Android 绝对路径通常是 `/data/user/0/<目标包名>/files/zygisk_il2cpp_mcp/il2cpp_dump.cs`。每次调用会原子替换上一份文件。
+对应 Android 路径通常位于 `/data/user/0/<目标包名>/files/zygisk_il2cpp_mcp/`。每次生成独立文件，不覆盖旧 Dump；结果只含 `success/path/class_count`，不返回正文。
+
+类型流程图、冻结/追踪管理、多层基址链、批量加载。流程图使用 `il2cpp_type_graph`；已有 Dump、对象检查器和 `memory_scan_base` 均直接扩展，无重复同义工具。
+
+## Java 层对象渲染与 ImGui 控制
+
+原有 38 个渲染/UI 工具继续保留，新增 33 个工作台与高级 UI 工具，共 71 个；接入默认开启的原有功能组，Lua 程序还依赖 `lua`。浏览器管理接口仍不暴露给 Agent。
+
+新增 `overlay_upsert_window/upsert_node/apply_tree` 支持独立父窗口、子窗口、控件树、表格/分页及绑定；`overlay_program_*` 管理可编程 UI。`render_*_rule(s)` 管理字段规则、血条和自动包围盒。工作台新增帧队列检查器/精确调用、符号书签和目标端剪贴板/文件导出。完整参数以 `debug_help` 为准。
+
+- UI：`overlay_status`、`overlay_set`、`overlay_set_window`、`overlay_reset`，管理中英语言、Classic/Dark/Light 主题、可见性、原生折叠、位置尺寸、缩放和透明度。
+- 对象：`render_status`、`render_list_objects`、`render_add_object`、`render_update_object`、`render_remove_object`、`render_clear_objects`、`render_set_object_position`、`render_set_object_bones`。
+- 样式/相机：`render_set_style`、`render_set_camera`、`render_list_cameras`、`render_set_camera_matrix`、`render_project`。
+- Unity 采样：`render_bind_update`、`render_unbind_update`、`render_binding_status`、`render_find_objects`。
+- 连续跟踪：`render_track_class`、`render_list_tracked_classes`、`render_untrack_class`、`render_refresh_class`。
+- 相机刷新与异步投影：`render_refresh_cameras`、`render_projection_result`。
+- 自定义 UI：`overlay_set_panel`、`overlay_set_widget`、`overlay_list_custom_ui`、`overlay_remove_custom_ui`、`overlay_ui_events`。
+- 调用日志：`overlay_call_logs`、`overlay_clear_call_logs`，独立于 Toast。
+- 图元：`render_set_primitive`、`render_list_primitives`、`render_remove_primitive`、`render_clear_primitives`。
+
+显示走已有 Java SurfaceView，不 Hook EGL。Java 菜单启动后自动探测已加载 IL2CPP 的 MonoBehaviour 帧方法；检查 `render_binding_status` 的 automatic/auto_error/automatic_probes、thread_id 和 age_ms。探测失败保留普通内存/类型工具；先解除自动探针后仍可通过 `render_bind_update` 手动绑定。`render_find_objects` 返回受理状态，需要轮询结果。普通目标可提供手动坐标、骨骼和相机矩阵；对象操作只改变可视化，不销毁或移动游戏对象。
+
+每条命令可通过 `debug_help` 查询；完整示例和兼容限制见。新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
+
+矩阵被裁剪时使用 WorldToScreenPoint；此模式的 `render_project` 返回 pending/request_id，通过 `render_projection_result` 获取结果。所有 Unity 投影仍在游戏帧执行。
+
+面板、控件和图元工具接收 descriptor 对象，按 ID 创建或局部更新。普通控件保存描述不执行动作，用户操作才触发绑定命令；Lua 程序需显式启用才能执行。图元新增 quad/polygon/bezier/mesh、前景层和裁剪区域，屏幕模式无需 Unity。手动菜单隐藏窗口树/控件/Lua 程序创建编辑器，MCP 接口及已创建控件仍可用；语言/主题/Toast 在“设置”页，调用历史在“MCP 调用日志”页。
+
+对象位置和已绑定字段按游戏帧采样，旧 `sample_hz/refresh_ms` 参数保留兼容但不再控制采样周期。`workspace_export_result/text/job/logs` 在目标侧导出，返回状态/路径而非文件正文；文件位于目标 `files/zygisk_il2cpp_mcp/exports`，预设位于 `presets`。预设不会自动恢复游戏动作或运行脚本。
+
+语言、主题、缩放、透明度、Toast 及原生窗口/表格布局自动保存到目标 `files/zygisk_il2cpp_mcp/settings/ui.json` 并加载，不恢复旧对象地址或执行游戏动作。手动浏览器改为场景/IL2CPP 分页表格，检查器、调用与分析各自独立窗口；分析默认自动读取范围，长度选项位于高级设置。
 
 ## Memory tools
 
@@ -144,15 +177,15 @@ files/zygisk_il2cpp_mcp/il2cpp_dump.cs
 
 类型化调用支持 `bool`、`i8`、`u8`、`i16`、`u16`、`i32`、`u32`、`i64`、`u64`、`f32`、`f64`、`ptr32` 和 `ptr64`。指针类型需要按目标进程 ABI 选择；整数和指针写入值可使用 `0x...` 字符串。
 
-指针链从 `module load_bias + base_offset` 或 `base_address + base_offset` 开始。每个 `offsets` 元素执行“读取当前指针，再加该有符号 Offset”；结果会返回全部中间步骤。基址扫描的 `workers=0` 会自动选择至少 2 个、最多 32 个线程，也可显式指定。System 后端允许并行 I/O；驱动后端为了兼容未知 ioctl 线程安全性，底层读操作保持串行，但分片调度和匹配仍为多线程。
+指针链从 `module load_bias + base_offset` 或 `base_address + base_offset` 开始。每个 `offsets` 元素执行“读取当前指针，再加该有符号 Offset”；结果返回全部中间步骤。基址扫描的 `workers=0` 自动选择至少 2 个、最多 32 个线程，也可显式指定；分片读取统一使用可并行的 KittyMemory，字节匹配使用 KittyScanner。
 
-这些工具不依赖 IL2CPP 初始化，可用于普通 Native、Mono 或其他引擎进程。默认内存访问使用 `process_vm_readv/process_vm_writev`，并在操作前校验完整映射区间权限。WebUI 选择驱动后，只有内存读写和搜索切换到驱动；模块枚举、地址归属、IL2CPP、Dobby、Lua 调度、汇编和断点仍走原系统路径。
+这些工具不依赖 IL2CPP 初始化，可用于普通 Native、Mono 或其他引擎进程。所有目标内存读写经 KittyMemory 的严格 `Normal` syscall 模式；只接受完整传输，不跳过不可读页填充伪造数据。扫描在有上限的本地快照上进行，保留 nibble 通配符、对齐和区域多选。模糊搜索/数值过滤继续保留已有会话语义。
 
-### 可选内核驱动
+### 内核驱动已停用
 
-WebUI 支持 `system`、`kpm_kma`、`dit_pro_kpm`、`kpm_ap_read_ioctl`、`kpm_memory_ioctl_hook`、`kpm_tear_ioctl_hook`、`dit_netlink`、`gt1_rtdev`、`gt2_rthook`、`paradise` 和 `qx`。驱动在第一次内存操作时才探测；探测或 I/O 失败后该后端会进入 disabled 状态，可用 `memory_backend_status` 查看原因，不会退出目标进程。
+WebUI 不再提供驱动选择或节点输入；旧驱动配置不加载，KMA 驱动库不参与链接。`memory_backend_status` 返回 `backend: kittymemory`、`drivers_enabled: false`。32/64 位共享该路径；访问失败只使当前请求失败，不切回驱动。
 
-除 System 外的当前驱动适配器只在 ARM64 启用。随机设备节点可在 WebUI 的 Driver node 中明确填写 `/dev/...`。
+代码补丁也使用 KittyMemory，临时开放所需页的写权限、写入、恢复权限并刷新指令缓存。Dobby 仍负责安装/解除 Hook 和自己的 trampoline 内部操作；`dobby_patch_code` 保留旧名称以兼容客户端，但不再调用 DobbyCodePatch。
 
 ### 模块和重复名称
 
@@ -204,8 +237,8 @@ WebUI 支持 `system`、`kpm_kma`、`dit_pro_kpm`、`kpm_ap_read_ioctl`、`kpm_m
 ## 汇编与硬件断点 tools
 
 - `assembly_status` / `assembly_assemble`：查询状态并把单条 AArch64 文本指令汇编为机器码。
-- `assembly_disassemble`：使用原系统读取路径和 Capstone 反汇编 ARM64 内存。
-- `assembly_patch`：汇编后通过 DobbyCodePatch 修改可执行地址。
+- `assembly_disassemble`：使用 KittyMemory 读取和 Capstone 反汇编 ARM64 内存。
+- `assembly_patch`：汇编后通过 KittyMemory 修改可执行地址并恢复权限。
 - `breakpoint_status` / `breakpoint_set` / `breakpoint_list` / `breakpoint_hits` / `breakpoint_clear` / `breakpoint_clear_all`：管理不暂停进程的 ARM64 perf 硬件执行断点和数据监视点。
 - `breakpoint_backtrace`：通过 `breakpoint_hits` 返回的 `hit_id` 读取命中时采样的用户栈回溯，并解析每帧所属映射/模块。
 
@@ -221,6 +254,12 @@ WebUI 支持 `system`、`kpm_kma`、`dit_pro_kpm`、`kpm_ap_read_ioctl`、`kpm_m
 引擎通过受限回调读取目标实时内存，并把 `/proc/self/maps` 中的只读区域传给 Ghidra，用于分析全局数据和已初始化的运行时字符串。函数分析严格限制在请求范围内；范围外直接分支会生成截断桩，不再导致整个反编译请求失败。
 
 当前限制：范围外尾调用可能仍显示为 `halt_missing()`；调用目标尚未批量替换成 IL2CPP 方法名；未初始化的 IL2CPP 编码字符串槽不会自动展开为文本。反编译器缺失、ABI 不兼容或初始化失败只会停用这一功能，不影响内存、Hook、Dobby、Lua 或断点工具。
+
+## 原生 AI 逻辑工具
+
+`logic_program_schema/validate/set/list/get/control/remove` 提供独立于 Lua 的通用 JSON 逻辑运行时。AI 通过 MCP 查询语法并提交变量、条件、遍历、动态对象源、字段读取及绘制/UI 变量输出；目标游戏的字段、筛选规则和窗口布局由调用方下发，底层不预装业务程序。
+
+原生界面的“AI 逻辑”页可编辑、校验、启停和查看诊断。设置 `auto_start=true` 后保存 `default` 工作区预设，可在下次启动重新解析对象源。当前不支持原生逻辑中的方法调用、字段写入或 Hook。语言和恢复语义。
 
 ## Help 与兼容性
 
@@ -242,7 +281,7 @@ WebUI 支持 `system`、`kpm_kma`、`dit_pro_kpm`、`kpm_ap_read_ioctl`、`kpm_m
 - `dobby_hook_return`：按地址安装固定返回值 Hook。
 - `dobby_instrument` / `dobby_trace_get`：插桩并读取执行计数、最新线程和寄存器快照。
 - `dobby_trace_backtrace`：读取 Dobby 插桩最近一次命中的 ARM64 帧指针回溯，并解析模块区域。
-- `dobby_patch_code`：使用 `DobbyCodePatch` 写入机器码，单次最多 4096 字节。
+- `dobby_patch_code`：兼容名称；使用 KittyMemory 写入机器码，单次最多 4096 字节。回滚需要自行保留并写回原字节；`dobby_destroy` 不撤销独立字节补丁。
 - `dobby_destroy`：卸载通过 Dobby Hook/Instrument 安装的拦截。
 - `dobby_list_hooks`：列出由桥接层记录的 Hook 和插桩。
 - `dobby_version`：读取内置 Dobby 版本标识。

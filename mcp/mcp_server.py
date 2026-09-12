@@ -12,15 +12,22 @@ import struct
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+if __package__:
+    from . import render_tools, workspace_tools, debug_tools, logic_tools
+else:
+    import render_tools, workspace_tools, debug_tools, logic_tools
+
 
 SERVER_NAME = "zygisk-il2cpp-mcp"
-SERVER_VERSION = "2.2.1"
+SERVER_VERSION = "2.4.0"
 LATEST_PROTOCOL = "2025-11-25"
 SUPPORTED_PROTOCOLS = {
     "2024-11-05",
@@ -34,6 +41,8 @@ MAX_BODY_BYTES = 4 * 1024 * 1024
 FEATURES: dict[str, str] = {
     "connection": "Connection and target availability tools",
     "ui": "Clipboard, input box, and in-app Toast tools",
+    "overlay_ui": "In-game ImGui language, theme, window and visibility controls",
+    "rendering": "Java SurfaceView object visualization, styles, cameras and game-frame sampling",
     "il2cpp_metadata": "IL2CPP status, dump, metadata listing, and fuzzy search",
     "il2cpp_invoke": "IL2CPP managed method invocation",
     "il2cpp_objects": "IL2CPP object, List, array, and Dictionary inspection",
@@ -44,6 +53,7 @@ FEATURES: dict[str, str] = {
     "memory_search": "Exact, fuzzy, and filtered memory searches",
     "pointer_chain": "Base scans and multi-level pointer-chain resolution",
     "dobby": "Native Dobby hooks, symbols, and code patches",
+    "frida": "Optional embedded Frida Gum instrumentation and Stalker",
     "trace": "Dobby execution tracing and trace backtraces",
     "lua": "Embedded LuaJIT execution",
     "assembly": "Assembly, disassembly, and instruction patching",
@@ -207,23 +217,45 @@ class HookSocketClient:
             data.extend(chunk)
         return bytes(data)
 
-    def call(self, command: str, *, timeout: float | None = None, retry_forward: bool = True) -> str:
+    def call(self, command: str, *, timeout: float | None = None, retry_forward: bool = True,
+             _query_diagnostics: bool = True) -> str:
         command = _single_line(command, "command").strip()
         if not command:
             raise BridgeError("command cannot be empty")
         if len(command.encode("utf-8")) > 64 * 1024:
             raise BridgeError("command is too long")
 
+        diagnostic = _query_diagnostics and command.split()[0] in {"IL2CPP_FIND_METHOD", "IL2CPP_METHODS"}
+        wire_command = f"MCP_QUERY_V1 {command}" if diagnostic else command
+        last_stage: dict[str, Any] | None = None
+        connected = False
         try:
             with socket.create_connection(
                 (self.config.host, self.config.port),
                 timeout=timeout or self.config.timeout,
             ) as sock:
+                connected = True
                 sock.settimeout(timeout or self.config.timeout)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                sock.sendall(command.encode("utf-8") + b"\n")
+                sock.sendall(wire_command.encode("utf-8") + b"\n")
                 header = self._recv_line(sock)
+                stage_count = 0
+                while diagnostic and header.startswith("MCP_STAGE "):
+                    stage_count += 1
+                    if stage_count > 4097:
+                        raise BridgeError("too many native diagnostic stages")
+                    try:
+                        stage = json.loads(header[len("MCP_STAGE "):])
+                    except (ValueError, TypeError) as exc:
+                        raise BridgeError("invalid native diagnostic stage") from exc
+                    if not isinstance(stage, dict) or not isinstance(stage.get("stage"), str):
+                        raise BridgeError("invalid native diagnostic stage")
+                    last_stage = stage
+                    header = self._recv_line(sock)
                 if header.startswith("ERR "):
+                    if diagnostic and last_stage is None and header == "ERR UNKNOWN_COMMAND":
+                        # Old module rejected the envelope, so the read-only query was not run.
+                        return self.call(command, timeout=timeout, retry_forward=False, _query_diagnostics=False)
                     raise BridgeError(header[4:].strip() or "hook call failed")
                 if not header.startswith("OK "):
                     raise BridgeError(f"unexpected hook response: {header!r}")
@@ -232,12 +264,24 @@ class HookSocketClient:
                 except ValueError as exc:
                     raise BridgeError(f"invalid hook response header: {header!r}") from exc
                 return self._recv_exact(sock, body_length).decode("utf-8", errors="strict").rstrip("\n")
-        except BridgeError:
+        except BridgeError as exc:
+            if last_stage is not None:
+                raise BridgeError(f"{command.split()[0]}: {exc}; last_native_stage="
+                                  + json.dumps(last_stage, ensure_ascii=False)
+                                  + ". This is a stage breadcrumb, not a confirmed crash backtrace; do not replay automatically.") from exc
             raise
         except OSError as exc:
-            if retry_forward and self._can_auto_forward():
+            if not connected and retry_forward and self._can_auto_forward():
                 self._adb_forward()
-                return self.call(command, timeout=timeout, retry_forward=False)
+                return self.call(command, timeout=timeout, retry_forward=False, _query_diagnostics=_query_diagnostics)
+            if connected:
+                raise BridgeError(
+                    f"{command.split()[0]} transport failed after connecting to "
+                    f"{self.config.host}:{self.config.port}: {exc}. "
+                    "The target may be busy, disconnected or restarted; the command was not replayed. "
+                    "Check ping/status before reusing runtime addresses."
+                    + (" last_native_stage=" + json.dumps(last_stage, ensure_ascii=False) if last_stage is not None else "")
+                ) from exc
             raise BridgeError(
                 f"cannot connect to hook service at {self.config.host}:{self.config.port}: {exc}"
             ) from exc
@@ -370,7 +414,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "input_and_wait",
         "title": "Show input box and wait",
-        "description": "Open the Unity input box, wait for completion, and return the entered text.",
+        "description": "Open the Unity input box, wait for completion, and return the entered text. Other MCP requests remain available while waiting. After the box opens, a concurrent push_input_result can complete it. Only one input wait/dialog operation may be active per MCP dispatcher; a competing one returns INPUT_REQUEST_BUSY.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -386,7 +430,7 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "push_input_result",
         "title": "Push input result",
-        "description": "Push a result into the hook input state, primarily for automation and testing.",
+        "description": "Push a result into the hook input state, primarily for automation and testing. May run concurrently with input_and_wait/wait_input once the input box is open; do not push before SHOW_INPUT_BOX has initialized the input state.",
         "inputSchema": {
             "type": "object",
             "properties": {"text": {"type": "string"}},
@@ -473,8 +517,8 @@ TOOLS.extend(
         {
             "name": "il2cpp_dump_file",
             "title": "Dump IL2CPP metadata to app storage",
-            "description": "Write fields, properties, methods, addresses, and RVAs directly to files/zygisk_il2cpp_mcp/il2cpp_dump.cs in the target app private directory. Returns success only; dump data is never sent through MCP.",
-            "inputSchema": EMPTY_SCHEMA,
+            "description": "Dump fields, properties, methods and RVAs into a new private files/zygisk_il2cpp_mcp/il2cpp_dump_*.cs file. Optional exact image, namespace and class_name filters; namespace=empty selects the global namespace. No arguments dumps all metadata. Returns success, path and class_count only; never returns dump contents. Empty selections fail without creating a dump.",
+            "inputSchema": {"type": "object", "properties": debug_tools.TYPE_SELECTION, "additionalProperties": False},
             "annotations": {"openWorldHint": False},
         },
         {
@@ -589,7 +633,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_hook_return",
             "title": "Hook IL2CPP method return",
-            "description": "Resolve an IL2CPP method and install a Dobby replacement that returns a fixed ABI value.",
+            "description": "Resolve an IL2CPP method and install a Dobby replacement that returns a fixed ABI value, skipping the entire method body for all instances. Calling again updates our existing same-ABI fixed return without rehooking. Other hook/trace owners are not overwritten; a different ABI requires explicit removal first.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -617,7 +661,7 @@ TOOLS.extend(
         {
             "name": "memory_backend_status",
             "title": "Get memory backend status",
-            "description": "Return the WebUI-selected memory read/write backend and its lazy probe state. This does not initialize a kernel driver.",
+            "description": "Report KittyMemory read/write and KittyScanner status. Kernel drivers are disabled and old driver configuration is ignored.",
             "inputSchema": EMPTY_SCHEMA,
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
         },
@@ -909,7 +953,7 @@ TOOLS.extend(
         {
             "name": "dobby_hook_return",
             "title": "Install fixed-return Dobby hook",
-            "description": "Install a generated replacement stub at a raw address with a fixed return value.",
+            "description": "Install a generated fixed-return stub at a raw executable address, skipping the original body. Calling again updates our existing same-ABI fixed return atomically without rehooking. Other hook/trace owners are not overwritten; a different ABI requires explicit removal first. The caller must choose the correct native return ABI.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -925,10 +969,10 @@ TOOLS.extend(
         {
             "name": "dobby_instrument",
             "title": "Instrument native address",
-            "description": "Install DobbyInstrument at an address and count executions.",
+            "description": "Install DobbyInstrument. mode=backtrace (default) captures per-hit frame-pointer backtraces; counter counts without walking the stack. Manage using dobby_trace_list/control/hits.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"address": {"type": "string"}},
+                "properties": {"address": {"type": "string"}, "mode": {"type": "string", "enum": ["backtrace", "counter"]}},
                 "required": ["address"],
                 "additionalProperties": False,
             },
@@ -949,7 +993,7 @@ TOOLS.extend(
         {
             "name": "dobby_patch_code",
             "title": "Patch native code",
-            "description": "Apply hexadecimal machine-code bytes with DobbyCodePatch (maximum 4096 bytes).",
+            "description": "Apply hexadecimal machine-code bytes with KittyMemory (maximum 4096 bytes); restore page permissions and flush the instruction cache. The tool name is retained for compatibility; save original bytes yourself for rollback.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"address": {"type": "string"}, "hex_bytes": {"type": "string", "pattern": "^[0-9A-Fa-f]+$"}},
@@ -961,7 +1005,7 @@ TOOLS.extend(
         {
             "name": "dobby_destroy",
             "title": "Destroy Dobby hook",
-            "description": "Restore a hook, instrumentation point, or tracked patch using DobbyDestroy.",
+            "description": "Restore a Dobby hook or instrumentation point using DobbyDestroy. Does not undo standalone byte/assembly patches; write saved original bytes to roll those back.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"target_address": {"type": "string"}},
@@ -1057,7 +1101,7 @@ TOOLS.extend(
         {
             "name": "assembly_disassemble",
             "title": "Disassemble ARM64 memory",
-            "description": "Read through the original system path and disassemble an executable ARM64 memory range with Capstone.",
+            "description": "Read through KittyMemory and disassemble an ARM64 memory range with Capstone.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1073,7 +1117,7 @@ TOOLS.extend(
         {
             "name": "assembly_patch",
             "title": "Assemble and patch ARM64 code",
-            "description": "Assemble one AArch64 instruction and patch an executable address with DobbyCodePatch.",
+            "description": "Assemble one AArch64 instruction and patch an executable address with KittyMemory, restoring page permissions and flushing the instruction cache.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"address": {"type": "string"}, "instruction": {"type": "string", "maxLength": 1024}},
@@ -1374,7 +1418,7 @@ TOOLS.extend(
         {
             "name": "memory_scan_base",
             "title": "Scan for pointers to a base or address",
-            "description": "Multi-thread scan selected memory regions for pointers to a module base, module offset, or absolute target address.",
+            "description": "Multi-thread pointer scan for module/base/absolute address. Existing exact one-level search is unchanged when max_depth/max_offset are omitted. Supply max_depth 1..5 or max_offset 0..1048576 to build revalidated module-relative chains (max_results <=1000). Chain mode scans aligned pointers and positive offsets, with explicit partial-results limits; omit start/end to scan selected regions. Use memory_chain_store/batch to save/load returned recipes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1386,6 +1430,11 @@ TOOLS.extend(
                     "memory_types": MEMORY_REGION_TYPES_SCHEMA,
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000},
                     "workers": {"type": "integer", "minimum": 0, "maximum": 32, "default": 0, "description": "Worker threads; 0 selects an automatic value of at least two."},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "max_offset": {"type": ["string", "integer"], "description": "Maximum positive per-level offset, 0..1048576; enables chain mode."},
+                    "budget_mb": {"type": "integer", "minimum": 16, "maximum": 4096, "description": "Chain scan total read budget in MiB (default 512); enables chain mode."},
+                    "candidate_limit": {"type": "integer", "minimum": 1024, "maximum": 65536, "description": "Chain candidates per level (default 16384); partial results include stop_reasons."},
+                    "time_ms": {"type": "integer", "minimum": 1000, "maximum": 30000, "description": "Chain scan time budget in ms (default 15000)."},
                 },
                 "additionalProperties": False,
             },
@@ -1394,7 +1443,7 @@ TOOLS.extend(
         {
             "name": "breakpoint_backtrace",
             "title": "Read breakpoint-hit backtrace",
-            "description": "Return and module-resolve a frame-pointer backtrace captured with a hardware breakpoint hit.",
+            "description": "Return one hardware breakpoint hit's frame-pointer backtrace, PC/SP/LR, hit count, thread and captured ARM64 X0-X30/SP/PC registers; resolve frame modules when enabled. Registers are a read-only hit-time snapshot from external root perf sampling, not a paused live thread or an editable register context.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"hit_id": {"type": "integer", "minimum": 1}, "max_frames": {"type": "integer", "minimum": 1, "maximum": 64, "default": 32}},
@@ -1417,7 +1466,21 @@ TOOLS.extend(
 )
 
 
+TOOLS.extend(render_tools.TOOLS)
+TOOLS.extend(workspace_tools.TOOLS)
+TOOLS.extend(debug_tools.TOOLS)
+TOOLS.extend(logic_tools.TOOLS)
+
+
 def tool_features(name: str) -> tuple[str, ...]:
+    if name in logic_tools.BY_NAME:
+        return logic_tools.features(name)
+    if name in debug_tools.BY_NAME:
+        return debug_tools.features(name)
+    if name in workspace_tools.BY_NAME:
+        return workspace_tools.features(name)
+    if name in render_tools.BY_NAME:
+        return render_tools.features(name)
     if name in {"ping", "connection_info", "configure_connection"}:
         return ("connection",)
     if name.startswith("mcp_toast_") or name in {
@@ -1602,17 +1665,20 @@ class ToolDispatcher:
         self.config = config
         self.registry = registry or FeatureRegistry()
         self._lock = threading.RLock()
+        self._call_context = threading.local()
+        self._input_lock = threading.RLock()
 
     def _client(self) -> HookSocketClient:
-        return HookSocketClient(self.config)
+        return HookSocketClient(getattr(self._call_context, "config", self.config))
 
-    def _info(self) -> dict[str, Any]:
+    def _info(self, config: ConnectionConfig | None = None) -> dict[str, Any]:
+        config = config or getattr(self._call_context, "config", self.config)
         return {
-            "host": self.config.host,
-            "port": self.config.port,
-            "timeout": self.config.timeout,
-            "auto_adb_forward": self.config.auto_adb_forward,
-            "adb_serial": self.config.adb_serial,
+            "host": config.host,
+            "port": config.port,
+            "timeout": config.timeout,
+            "auto_adb_forward": config.auto_adb_forward,
+            "adb_serial": config.adb_serial,
         }
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1697,14 +1763,76 @@ class ToolDispatcher:
             "breakpoint_clear_all": self.breakpoint_clear_all,
         }
         method = methods.get(name)
+        if name in render_tools.BY_NAME:
+            method = lambda args: self._render_call(name, args)
+        if name in debug_tools.BY_NAME:
+            method = lambda args: self._debug_call(name, args)
+        if name in workspace_tools.BY_NAME:
+            method = lambda args: self._workspace_call(name, args)
+        if name in logic_tools.BY_NAME:
+            method = lambda args: self._logic_call(name, args)
         if method is None:
             raise BridgeError(f"unknown tool: {name}")
         if not isinstance(arguments, dict):
             raise BridgeError("tool arguments must be an object")
         self.registry.require(name)
+        # Native commands already serialize their own runtime mutations. Do not
+        # hold a dispatcher-wide lock across WAIT_INPUT: its producer must run.
+        previous = getattr(self._call_context, "config", None)
         with self._lock:
+            self._call_context.config = replace(self.config)
+        try:
             self._notify_mcp_call(name, arguments)
             return method(arguments)
+        finally:
+            if previous is None:
+                del self._call_context.config
+            else:
+                self._call_context.config = previous
+
+    def _logic_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = logic_tools.encode(name, arguments)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            raise BridgeError(str(exc)) from exc
+        return self._json_call(command)
+
+    def _debug_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = debug_tools.encode(name, arguments)
+        except (ValueError, OverflowError) as exc:
+            raise BridgeError(str(exc)) from exc
+        return self._json_call(command)
+
+    def _render_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = render_tools.encode(name, arguments)
+        except (ValueError, OverflowError) as exc:
+            raise BridgeError(str(exc)) from exc
+        return self._json_call(command)
+
+    def _workspace_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = workspace_tools.encode(name, arguments, self._invoke_token)
+            required = workspace_tools.extra_features(name, arguments)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            raise BridgeError(str(exc)) from exc
+        # Starting an existing program must respect its saved game-action grant,
+        # including a descriptor patch that omits the grant field.
+        if name == "overlay_program_control" and arguments["operation"] != "stop":
+            old = self._json_call("UI_PROGRAM_GET " + self._hex_text(arguments["id"]))
+            if old.get("allow_game_actions"):
+                required.update(workspace_tools.GAME_WRITE_FEATURES)
+        elif name == "overlay_program_set":
+            descriptor = arguments["descriptor"]
+            if "allow_game_actions" not in descriptor:
+                definitions = self._json_call("UI_PROGRAM_LIST")
+                if any(p.get("id") == descriptor["id"] and p.get("allow_game_actions") for p in definitions.get("programs", [])):
+                    required.update(workspace_tools.GAME_WRITE_FEATURES)
+        disabled = sorted(feature for feature in required if not self.registry.enabled(feature))
+        if disabled:
+            raise BridgeError("operation depends on disabled MCP features: " + ", ".join(disabled))
+        return self._json_call(command)
 
     def _notify_mcp_call(self, name: str, arguments: dict[str, Any]) -> None:
         if name in {"connection_info", "configure_connection", "mcp_toast_set_enabled", "mcp_toast_show"}:
@@ -1732,6 +1860,10 @@ class ToolDispatcher:
         return self._info()
 
     def configure_connection(self, args: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            return self._configure_connection_locked(args)
+
+    def _configure_connection_locked(self, args: dict[str, Any]) -> dict[str, Any]:
         candidate = ConnectionConfig(
             host=self.config.host,
             port=self.config.port,
@@ -1763,7 +1895,7 @@ class ToolDispatcher:
             candidate.adb_serial = None if serial is None or serial.strip() == "" else serial
         candidate.validate()
         self.config = candidate
-        return self._info()
+        return self._info(candidate)
 
     def get_clipboard(self, _: dict[str, Any]) -> dict[str, Any]:
         return {"text": self._client().call("GET_CLIPBOARD")}
@@ -1794,21 +1926,35 @@ class ToolDispatcher:
 
     def show_input_box(self, args: dict[str, Any]) -> dict[str, Any]:
         title, hint, prefill = self._input_args(args)
-        response = self._client().call(f"SHOW_INPUT_BOX {title}|{hint}|{prefill}")
+        with self._input_session():
+            response = self._client().call(f"SHOW_INPUT_BOX {title}|{hint}|{prefill}")
         return {"shown": response == "INPUT_BOX_SHOWN", "response": response}
 
+    @contextmanager
+    def _input_session(self):
+        if not self._input_lock.acquire(blocking=False):
+            raise BridgeError("INPUT_REQUEST_BUSY: another input request is waiting; use push_input_result to complete it")
+        try:
+            yield
+        finally:
+            self._input_lock.release()
+
+    def _input_timeout(self, args: dict[str, Any]) -> int:
+        return self._bounded_integer(args.get("timeout_ms", 120000), "timeout_ms", 100, 300000)
+
     def wait_input(self, args: dict[str, Any]) -> dict[str, Any]:
-        timeout_ms = int(args.get("timeout_ms", 120000))
-        if not 100 <= timeout_ms <= 300000:
-            raise BridgeError("timeout_ms must be between 100 and 300000")
-        text = self._client().call(f"WAIT_INPUT {timeout_ms}", timeout=timeout_ms / 1000 + 5)
+        timeout_ms = self._input_timeout(args)
+        with self._input_session():
+            text = self._client().call(f"WAIT_INPUT {timeout_ms}", timeout=timeout_ms / 1000 + 5)
         return {"text": text}
 
     def input_and_wait(self, args: dict[str, Any]) -> dict[str, Any]:
-        shown = self.show_input_box(args)
-        if not shown["shown"]:
-            raise BridgeError(f"input box did not open: {shown['response']}")
-        return self.wait_input(args)
+        self._input_timeout(args)  # Invalid waits must not open/reset the input box.
+        with self._input_session():
+            shown = self.show_input_box(args)
+            if not shown["shown"]:
+                raise BridgeError(f"input box did not open: {shown['response']}")
+            return self.wait_input(args)
 
     def push_input_result(self, args: dict[str, Any]) -> dict[str, Any]:
         text = _single_line(args.get("text", ""), "text")
@@ -1820,7 +1966,14 @@ class ToolDispatcher:
         if not command:
             raise BridgeError("command is required")
         native_name = command.split(None, 1)[0].upper()
-        if native_name.startswith("IL2CPP_"):
+        if native_name == "MCP_QUERY_V1":
+            raise BridgeError("MCP_QUERY_V1 is an internal envelope; call the IL2CPP metadata tool or its original native command")
+        workspace_features = logic_tools.native_features(native_name) or debug_tools.native_features(native_name) or workspace_tools.native_features(native_name)
+        if workspace_features is not None:
+            raw_features = workspace_features
+        elif native_name.startswith(("RENDER_", "OVERLAY_")):
+            raw_features = render_tools.native_features(native_name)
+        elif native_name.startswith("IL2CPP_"):
             if native_name in {"IL2CPP_HOOK", "IL2CPP_HOOK_RETURN", "IL2CPP_UNHOOK"}:
                 raw_features = ("il2cpp_metadata", "il2cpp_hook")
             elif native_name == "IL2CPP_INVOKE":
@@ -1894,6 +2047,24 @@ class ToolDispatcher:
             value = json.loads(response)
         except json.JSONDecodeError as exc:
             raise BridgeError(f"native bridge returned invalid JSON for {command.split()[0]}: {response!r}") from exc
+        # These two legacy native endpoints deliberately return arrays, also
+        # consumed directly by ImGui. Adapt only their documented list results
+        # to MCP's object-shaped structuredContent; keep the native wire stable.
+        words = command.split()
+        if isinstance(value, list) and words[0] == "MEMORY_CHAIN_BATCH":
+            if not all(isinstance(item, dict) and isinstance(item.get("success"), bool) for item in value):
+                raise BridgeError("MEMORY_CHAIN_BATCH returned invalid result items")
+            succeeded = sum(item["success"] for item in value)
+            return {"results": value, "total": len(value), "succeeded": succeeded, "failed": len(value) - succeeded}
+        if isinstance(value, list) and words[0] == "MEMORY_CHAIN_STORE" and len(words) == 2:
+            try:
+                selection = json.loads(bytes.fromhex(words[1]))
+            except (ValueError, UnicodeDecodeError):
+                selection = None
+            if isinstance(selection, dict) and selection.get("operation") == "list":
+                if not all(isinstance(item, dict) and isinstance(item.get("id"), str) and isinstance(item.get("recipe"), dict) for item in value):
+                    raise BridgeError("MEMORY_CHAIN_STORE returned invalid saved-chain items")
+                return {"chains": value, "total": len(value)}
         if not isinstance(value, dict):
             raise BridgeError("native bridge returned a non-object JSON result")
         return value
@@ -1929,6 +2100,14 @@ class ToolDispatcher:
     @classmethod
     def _invoke_token(cls, value: Any) -> str:
         if isinstance(value, dict):
+            if set(value) == {"fields"}:
+                if not isinstance(value["fields"], dict):
+                    raise BridgeError("struct fields must be an object")
+                workspace_tools._bounded_json(value)
+                encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                if len(encoded.encode("utf-8")) > 4096:
+                    raise BridgeError("struct argument exceeds 4096 UTF-8 bytes")
+                return "j" + cls._hex_text(encoded)
             if set(value) == {"enum"}:
                 value = value["enum"]
                 if isinstance(value, bool) or not isinstance(value, (str, int)):
@@ -1980,8 +2159,13 @@ class ToolDispatcher:
     def il2cpp_status(self, _: dict[str, Any]) -> dict[str, Any]:
         return self._json_call("IL2CPP_STATUS")
 
-    def il2cpp_dump_file(self, _: dict[str, Any]) -> dict[str, Any]:
-        return self._json_call("IL2CPP_DUMP_FILE", timeout=300.0)
+    def il2cpp_dump_file(self, args: dict[str, Any]) -> dict[str, Any]:
+        try:
+            selected = debug_tools.selection(args)
+        except ValueError as exc:
+            raise BridgeError(str(exc)) from exc
+        suffix = " " + workspace_tools._json(selected, 8192) if selected else ""
+        return self._json_call("IL2CPP_DUMP_FILE" + suffix, timeout=300.0)
 
     def il2cpp_list_images(self, args: dict[str, Any]) -> dict[str, Any]:
         limit = int(args.get("limit", 256))
@@ -2379,6 +2563,7 @@ class ToolDispatcher:
         return {"chain": chain, "write": written}
 
     def memory_scan_base(self, args: dict[str, Any]) -> dict[str, Any]:
+        chain_mode = any(key in args for key in ("max_depth", "max_offset", "budget_mb", "candidate_limit", "time_ms"))
         has_module = isinstance(args.get("module"), str) and bool(args.get("module"))
         has_target = "target_address" in args and args.get("target_address") is not None
         if has_module == has_target:
@@ -2417,11 +2602,24 @@ class ToolDispatcher:
             end = scan_module.get("end")
             if not isinstance(start, str) or not isinstance(end, str):
                 raise BridgeError("scan module lookup did not return a valid address range")
+        elif chain_mode and "start" not in args and "end" not in args:
+            start, end = "0x1", "0xffffffffffffffff"
         else:
             if "start" not in args or "end" not in args:
                 raise BridgeError("provide scan_module or both start and end")
             start = self._address(args["start"], "start")
             end = self._address(args["end"], "end")
+        if chain_mode:
+            depth = self._bounded_integer(args.get("max_depth", 3), "max_depth", 1, 5)
+            max_offset = self._signed_offset(args.get("max_offset", 4096), "max_offset")
+            if not 0 <= max_offset <= 1048576 or max_results > 1000:
+                raise BridgeError("chain mode requires max_offset 0..1048576 and max_results <=1000")
+            options = {"target_address": target, "start": start, "end": end, "pointer_size": pointer_size,
+                "max_depth": depth, "max_offset": str(max_offset), "max_results": max_results, "workers": workers, "regions": memory_types}
+            for key, default, low, high in (("budget_mb", 512, 16, 4096), ("candidate_limit", 16384, 1024, 65536), ("time_ms", 15000, 1000, 30000)):
+                options[key] = self._bounded_integer(args.get(key, default), key, low, high)
+            result = self._json_call("MEMORY_CHAIN_SCAN " + workspace_tools._json(options, 8192), timeout=max(self.config.timeout, options["time_ms"] / 1000.0 + 15.0))
+            return {"target": target_info, "pointer_size": pointer_size, "workers": workers, "search": result}
         result = self._json_call(
             f"MEMORY_POINTER_SCAN_MT {start} {end} {target} {pointer_size} "
             f"{max_results} {workers} {self._hex_text(memory_types)}",
@@ -2619,7 +2817,10 @@ class ToolDispatcher:
 
     def dobby_instrument(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._address(self._required_text(args, "address"), "address")
-        return self._json_call(f"DOBBY_INSTRUMENT {address}")
+        mode = args.get("mode", "backtrace")
+        if mode not in {"backtrace", "counter"}:
+            raise BridgeError("mode must be backtrace or counter")
+        return self._json_call(f"DOBBY_INSTRUMENT {address}" + (f" {mode}" if "mode" in args else ""))
 
     def dobby_trace_get(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._address(self._required_text(args, "address"), "address")
@@ -2672,6 +2873,12 @@ class ToolDispatcher:
         return self._json_call("DOBBY_LIST_HOOKS")
 
     def debug_help(self, args: dict[str, Any]) -> dict[str, Any]:
+        topic = args.get("command", "")
+        if isinstance(topic, str) and topic.lower() in workspace_tools.BY_NAME:
+            name = topic.lower()
+            self.registry.require(name)
+            tool = workspace_tools.BY_NAME[name]
+            return {"tool": name, "description": tool["description"], "inputSchema": tool["inputSchema"], "source": "local_mcp_catalog"}
         requested = _single_line(args.get("command", ""), "command").strip()
         if requested:
             requested_lower = requested.lower()
@@ -2920,17 +3127,48 @@ class McpServer:
 
     def run_stdio(self) -> None:
         self._stdio_active = True
-        for raw_line in sys.stdin.buffer:
-            if not raw_line.strip():
-                continue
+        slots = threading.BoundedSemaphore(16)
+        input_slots = threading.BoundedSemaphore(4)
+
+        def complete(message, capacity):
             try:
-                message = json.loads(raw_line)
-            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-                response = self._error(None, -32700, "Parse error", str(exc))
-            else:
                 response = self.handle(message)
-            if response is not None:
-                self._write_message(response)
+                if response is not None:
+                    self._write_message(response)
+            finally:
+                capacity.release()
+
+        try:
+            # Keep a separate producer lane: long decompiles/WAIT_INPUT calls
+            # must not occupy every worker needed by push_input_result.
+            with ThreadPoolExecutor(max_workers=8, thread_name_prefix="mcp-call") as workers, \
+                 ThreadPoolExecutor(max_workers=1, thread_name_prefix="mcp-input-push") as inputs:
+                for raw_line in sys.stdin.buffer:
+                    if not raw_line.strip():
+                        continue
+                    try:
+                        message = json.loads(raw_line)
+                    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                        response = self._error(None, -32700, "Parse error", str(exc))
+                    else:
+                        if isinstance(message, dict) and message.get("method") == "tools/call" and "id" in message:
+                            params = message.get("params")
+                            is_push = isinstance(params, dict) and params.get("name") == "push_input_result"
+                            pool, capacity = (inputs, input_slots) if is_push else (workers, slots)
+                            if capacity.acquire(blocking=False):
+                                try:
+                                    pool.submit(complete, message, capacity)
+                                except BaseException:
+                                    capacity.release()
+                                    raise
+                                continue
+                            response = self._success(message["id"], self._tool_result({"error": "MCP_SERVER_BUSY: retry after an active call completes"}, is_error=True))
+                        else:
+                            response = self.handle(message)
+                    if response is not None:
+                        self._write_message(response)
+        finally:
+            self._stdio_active = False
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
