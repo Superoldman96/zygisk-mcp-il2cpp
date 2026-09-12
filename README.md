@@ -5,6 +5,9 @@
 ## 频道
 TG：@il2cppmcp QQ：276342773
 
+## 发电
+https://ifdian.net/a/__mcp/plan
+
 ## 已实现
 
 - 通过持久目录中的 `apps.txt` 配置多个目标包名，同时匹配应用主进程和 `包名:子进程`。
