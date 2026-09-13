@@ -8,6 +8,8 @@ from mcp.mcp_server import ToolDispatcher, ConnectionConfig, BridgeError, TOOLS
 
 RECIPE = {"module": "libgame.so", "base_offset": "0x120", "offsets": ["0x20", -8]}
 EXAMPLES = {
+    "memory_search_tabs": {"op": "list"},
+    "memory_batch_edit": {"tab_id": 1, "value": "7878", "confirm": True},
     "memory_chain_export": {"session_id": 7},
     "memory_chain_batch": {"chains": [RECIPE, "saved-one"]},
     "memory_chain_store": {"operation": "save", "id": "npc", "recipe": RECIPE},
@@ -40,7 +42,10 @@ class DebugToolsTests(unittest.TestCase):
         for name, args in EXAMPLES.items():
             with self.subTest(name=name), patch.object(self.dispatcher, "_json_call", return_value={"ok": True}) as native, patch.object(self.dispatcher, "_notify_mcp_call") as toast:
                 self.assertEqual(self.dispatcher.call(name, args), {"ok": True})
-                native.assert_called_once_with(d.encode(name, args))
+                if name in {"memory_search_tabs", "memory_batch_edit"}:
+                    native.assert_called_once_with(d.encode(name, args), timeout=max(self.dispatcher.config.timeout, 75.0))
+                else:
+                    native.assert_called_once_with(d.encode(name, args))
                 toast.assert_called_once_with(name, args)
 
     def test_all_tools_have_help_and_no_duplicate_names(self):

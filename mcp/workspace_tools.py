@@ -79,12 +79,12 @@ DRAFT_VERSION = {"type": "string", "pattern": r"(?:0|[1-9][0-9]{0,19})", "maxLen
 QUERY_FIELDS = {"name": {**TEXT, "maxLength": 96}, "image": {**TEXT, "maxLength": 256},
     "query": {**TEXT, "maxLength": 256}, "class_filter": {**TEXT, "maxLength": 256}, "kind": integer(0, 2)}
 QUERY_CONFIG = obj({"format": r.enum("il2cpp-workbench-queries"), "schema": integer(1, 1),
-    "tabs": array(obj(QUERY_FIELDS, tuple(QUERY_FIELDS)), 16, 1)}, ("format", "schema", "tabs"))
+    "tabs": array(obj(QUERY_FIELDS, tuple(QUERY_FIELDS)), 512, 1)}, ("format", "schema", "tabs"))
 EXACT_METHOD = obj({"image": {**TEXT, "minLength": 1, "maxLength": 512}, "namespace": {**TEXT, "maxLength": 512},
     "class": {**TEXT, "minLength": 1, "maxLength": 512}, "token": integer(1, 2**32-1)}, ("image", "class", "token"))
 
 TOOLS = [
-    r.tool("workspace_browser", "Manage the manual IL2CPP search tabs without losing other searches. op=list/config/create/update/duplicate/remove/save/load/restore. Tab kind: 0 class, 1 method, 2 field. create accepts query fields; update needs the FULL tab from list, including decimal-string id/version for compare-and-swap. duplicate/remove use id; optional remove version. save/load require safe name<=48; restore requires config. Only pure queries persist; no object addresses, calls or hooks are replayed. Up to 16 tabs. Does not perform the search itself; use existing il2cpp search tools for results.", {"op": r.enum("list", "config", "create", "update", "duplicate", "remove", "save", "load", "restore"), "tab": obj({**QUERY_FIELDS, "id": SESSION_ID, "version": SESSION_ID}), "id": SESSION_ID, "version": SESSION_ID, "name": {**PRESET, "maxLength": 48}, "config": QUERY_CONFIG}, ("op",)),
+    r.tool("workspace_browser", "Manage the manual IL2CPP search tabs without losing other searches. op=list/config/create/update/duplicate/remove/save/load/restore. Tab kind: 0 class, 1 method, 2 field. create accepts query fields; update needs the FULL tab from list, including decimal-string id/version for compare-and-swap. duplicate/remove use id; optional remove version. save/load require safe name<=48; restore requires config. Only pure queries persist; no object addresses, calls or hooks are replayed. Up to 512 tabs. Does not perform the search itself; use existing il2cpp search tools for results.", {"op": r.enum("list", "config", "create", "update", "duplicate", "remove", "save", "load", "restore"), "tab": obj({**QUERY_FIELDS, "id": SESSION_ID, "version": SESSION_ID}), "id": SESSION_ID, "version": SESSION_ID, "name": {**PRESET, "maxLength": 48}, "config": QUERY_CONFIG}, ("op",)),
     r.tool("workspace_caller", "Read per-method argument drafts and bounded call history shared with the manual caller, or set_draft/clear_history. Uses exact image/namespace/class/token; op=get first to obtain version (decimal string, 0 if absent). set_draft needs version and equal-length values/kinds arrays<=32: 0 numeric token, 1 text/enum/reference, 2 boolean, 3 null, 4 struct JSON. Draft input is plain text, not marshaled yet. Never executes a method; use existing il2cpp_call_exact explicitly. History retains latest 5 calls/method within global bounds; result_reference is required for managed-object navigation and addresses can expire. Drafts/history never persist across restart.", {"op": r.enum("get", "set_draft", "clear_history"), "method": EXACT_METHOD, "version": DRAFT_VERSION, "values": array({"type": "string", "maxLength": 4096}, 32), "kinds": array(integer(0, 4), 32)}, ("op", "method")),
     r.tool("overlay_upsert_window", "Create/patch an independent native ImGui window. parent='' is a root window; parent=another window ID nests a child window. Native collapse, drag, resize and close remain usable. Maximum 32 windows, depth 8; IDs shared with nodes. Omitted fields preserve existing settings.", {"descriptor": WINDOW}, ("descriptor",)),
     r.tool("overlay_upsert_node", "Create/patch an ImGui control/container. New nodes need id/window/type. Parents must be containers in the same window; tabs accepts only tab children. Types include table, tabs, child, tree, plot, progress, color and Java input. Object binding paths: name/address/position.x|y|z/enabled/field.<DeclaringType::field>. Missing/stale bindings disable controls. write defaults false; object writes only field paths, queued on bound game frame. Events support Lua logic. action executes only on human interaction; game actions require game_thread=true. Placeholders {value}, {value_hex}, {value_token}.", {"descriptor": NODE}, ("descriptor",)),
@@ -231,7 +231,7 @@ def encode(name: str, args: dict, invoke: Callable[[Any], str] | None = None) ->
             data["method"] = {"namespace": "", **args["method"]}
             command = "WORKSPACE_CALLER"
         _bounded_json(data)
-        return command + " " + _json(data, 65536)
+        return command + " " + _json(data, 4*1024*1024 if name == "workspace_browser" else 65536)
     if name in SIMPLE:
         return SIMPLE[name]
     if name in DESCRIPTORS:
@@ -489,7 +489,9 @@ def native_features(command: str) -> tuple[str, ...] | None:
     if command.startswith("UI_TREE_") or command in {"UI_WINDOW_SET", "UI_VARIABLE_SET"}:
         return ("overlay_ui",)
     if command == "WORKSPACE_QUERY":
-        return ("overlay_ui", "rendering", *GAME_WRITE_FEATURES)
+        # Raw envelopes can contain relationship/snapshot readers as well as
+        # game-frame writes. Keep the escape hatch conservatively gated.
+        return ("overlay_ui", "rendering", "memory_read", "memory_maps", "pointer_chain", *GAME_WRITE_FEATURES)
     if command.startswith("WORKSPACE_EXPORT_"):
         return ("overlay_ui", "ui")
     if command.startswith("WORKSPACE_PRESET_"):

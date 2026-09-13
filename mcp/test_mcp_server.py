@@ -118,6 +118,8 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("memory_scan_base", names)
         self.assertIn("breakpoint_backtrace", names)
         self.assertIn("dobby_trace_backtrace", names)
+        for name in ("il2cpp_relation_selection", "debugger_status", "workspace_jobs", "journal_status"):
+            self.assertIn(name, names)
 
         invoke_tool = next(tool for tool in response["result"]["tools"] if tool["name"] == "il2cpp_invoke")
         argument_variants = invoke_tool["inputSchema"]["properties"]["arguments"]["items"]["anyOf"]
@@ -194,6 +196,30 @@ class McpServerTests(unittest.TestCase):
         registry.set("decompiler", False)
         with self.assertRaisesRegex(BridgeError, "decompiler"):
             dispatcher.raw_hook_call({"command": "DECOMP_STATUS"})
+
+        # Exact workflow protocols must be classified before the generic
+        # WORKSPACE_* overlay fallback.
+        registry.set("memory_read", False)
+        with self.assertRaisesRegex(BridgeError, "memory_read"):
+            dispatcher.raw_hook_call({"command": "WORKSPACE_MEMORY_CAPTURE 00"})
+        registry.set("memory_read", True)
+        registry.set("memory_write", False)
+        with self.assertRaisesRegex(BridgeError, "memory_write"):
+            dispatcher.raw_hook_call({"command": "WORKSPACE_CHANGES 00"})
+        registry.set("memory_write", True)
+        registry.set("memory_read", False)
+        with self.assertRaisesRegex(BridgeError, "memory_read"):
+            dispatcher.raw_hook_call({"command": "WORKSPACE_QUERY IL2CPP_RELATION_RESOLVE 00"})
+
+    def test_relationship_recipe_obeys_dynamic_feature_switches(self) -> None:
+        registry = FeatureRegistry()
+        registry.set("pointer_chain", False)
+        dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False), registry)
+        with self.assertRaisesRegex(BridgeError, "pointer_chain"):
+            dispatcher._relationship_call("il2cpp_relation_resolve", {
+                "session_id": "1-2-3", "path_id": 0,
+                "root_recipe": {"module": "libgame.so", "offsets": ["0x18"]},
+            })
 
     def test_il2cpp_search_and_field_commands(self) -> None:
         dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False))
@@ -410,6 +436,43 @@ class McpServerTests(unittest.TestCase):
             help_result = dispatcher.debug_help({"command": "assembly_patch"})
         json_call.assert_not_called()
         self.assertEqual("assembly_patch", help_result["tool"])
+
+    def test_new_tool_families_reach_their_exact_wire_commands(self) -> None:
+        dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False))
+        cases = (
+            ("il2cpp_relation_selection", {"op": "list"}, "IL2CPP_RELATION_SELECTION "),
+            ("debugger_status", {}, "DEBUGGER_CONTROL "),
+            ("workspace_jobs", {"op": "list"}, "WORKSPACE_JOBS "),
+            ("journal_status", {}, "JOURNAL_STATUS"),
+        )
+        for name, arguments, expected in cases:
+            with self.subTest(name=name), patch.object(dispatcher, "_notify_mcp_call"), patch.object(
+                dispatcher, "_json_call", return_value={"ok": True}
+            ) as json_call:
+                self.assertEqual({"ok": True}, dispatcher.call(name, arguments))
+                wire = json_call.call_args.args[0]
+                self.assertTrue(wire.startswith(expected), wire)
+
+    def test_debug_help_uses_global_filtered_catalog(self) -> None:
+        registry = FeatureRegistry()
+        dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False), registry)
+        catalog = dispatcher.debug_help({})
+        names = {item["name"] for item in catalog["tools"]}
+        self.assertIn("il2cpp_relation_find", names)
+        registry.set("il2cpp_metadata", False)
+        names = {item["name"] for item in dispatcher.debug_help({})["tools"]}
+        self.assertNotIn("il2cpp_relation_find", names)
+        with patch.object(dispatcher, "_json_call") as json_call, self.assertRaisesRegex(BridgeError, "il2cpp_metadata"):
+            dispatcher.debug_help({"command": "il2cpp_relation_find"})
+        json_call.assert_not_called()
+
+    def test_debug_help_native_topic_respects_raw_feature_gate(self) -> None:
+        registry = FeatureRegistry()
+        registry.set("memory_write", False)
+        dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False), registry)
+        with patch.object(dispatcher, "_json_call") as json_call, self.assertRaisesRegex(BridgeError, "memory_write"):
+            dispatcher.debug_help({"command": "MEMORY_WRITE"})
+        json_call.assert_not_called()
 
     def test_connection_info_has_structured_content(self) -> None:
         response = self.server.handle(

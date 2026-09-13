@@ -21,13 +21,15 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 if __package__:
-    from . import render_tools, workspace_tools, debug_tools, logic_tools
+    from . import (render_tools, workspace_tools, debug_tools, logic_tools,
+                   relationship_tools, paused_debug_tools, task_tools, workflow_tools)
 else:
     import render_tools, workspace_tools, debug_tools, logic_tools
+    import relationship_tools, paused_debug_tools, task_tools, workflow_tools
 
 
 SERVER_NAME = "zygisk-il2cpp-mcp"
-SERVER_VERSION = "2.4.0"
+SERVER_VERSION = "2.5.0"
 LATEST_PROTOCOL = "2025-11-25"
 SUPPORTED_PROTOCOLS = {
     "2024-11-05",
@@ -222,7 +224,8 @@ class HookSocketClient:
         command = _single_line(command, "command").strip()
         if not command:
             raise BridgeError("command cannot be empty")
-        if len(command.encode("utf-8")) > 64 * 1024:
+        command_limit = 8*1024*1024+64 if command.startswith("WORKSPACE_BROWSER ") else 64*1024
+        if len(command.encode("utf-8")) > command_limit:
             raise BridgeError("command is too long")
 
         diagnostic = _query_diagnostics and command.split()[0] in {"IL2CPP_FIND_METHOD", "IL2CPP_METHODS"}
@@ -661,7 +664,7 @@ TOOLS.extend(
         {
             "name": "memory_backend_status",
             "title": "Get memory backend status",
-            "description": "Report KittyMemory read/write and KittyScanner status. Kernel drivers are disabled and old driver configuration is ignored.",
+            "description": "Report the selected data-memory backend: local KittyMemory or authenticated external root-companion driver. Driver status is lazy and includes reason/transport. Selection and device node are configured in WebUI and apply after target restart; other IL2CPP/hooks/code patches remain local.",
             "inputSchema": EMPTY_SCHEMA,
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
         },
@@ -818,11 +821,11 @@ TOOLS.extend(
         {
             "name": "memory_search_exact",
             "title": "Exact-search multiple value types",
-            "description": "Search the same value as multiple selected integer/floating/pointer encodings. Each encoding creates an independent filterable session.",
+            "description": "Search multiple encodings. Also accepts GG-style expressions: 100;200:512 (unordered), 100;200::512 (ordered), 10~20 inclusive range, B/W/D/Q/F/E suffixes; hex supports wildcards, utf8/utf16 literal text. Advanced expressions/options use the shared typed engine and return sessions plus legacy searches. Group results are witnessed members, not OR matches. scan_mb/timeout_ms bound work; check truncated/stop_reason. For tabs/selection use memory_search_tabs. Ordinary scalar calls retain their legacy protocol.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "value_types": {"type": "array", "items": MEMORY_VALUE_KIND_SCHEMA, "minItems": 1, "uniqueItems": True},
+                    "value_types": {"type": "array", "items": render_tools.enum(*MEMORY_VALUE_FORMATS, "hex", "utf8", "utf16"), "minItems": 1, "uniqueItems": True},
                     "value": {"type": ["string", "number", "boolean"]},
                     "module_name": {"type": "string"},
                     "occurrence": {"type": "integer", "minimum": 1, "maximum": 4096, "default": 1},
@@ -831,6 +834,8 @@ TOOLS.extend(
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1024},
                     "alignment": {"type": "integer", "minimum": 1, "maximum": 4096},
                     "memory_types": MEMORY_REGION_TYPES_SCHEMA,
+                    "scan_mb": {"type": "integer", "minimum": 1, "maximum": 512},
+                    "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 60000},
                 },
                 "required": ["value_types", "value"],
                 "additionalProperties": False,
@@ -877,16 +882,16 @@ TOOLS.extend(
         {
             "name": "memory_filter_value",
             "title": "Filter search results by typed value",
-            "description": "Narrow a search session to typed values equal or not equal to the supplied value.",
+            "description": "Refine a shared typed/group search session. Omit value_type to use each native row's type, including mixed groups; modes: equals/not_equals/greater/less/changed/unchanged/increased/decreased/increased_by/decreased_by. value required only for comparison/delta modes; accepts joint/range expressions. Retains old candidates on read/incomplete-group failures. For legacy byte searches, supply value_type with scalar equals/not_equals to retain the original protocol.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "integer", "minimum": 1},
-                    "mode": {"type": "string", "enum": ["equals", "not_equals"]},
+                    "mode": render_tools.enum("equals", "not_equals", "greater", "less", "changed", "unchanged", "increased", "decreased", "increased_by", "decreased_by"),
                     "value_type": MEMORY_VALUE_KIND_SCHEMA,
                     "value": {"type": ["string", "number", "boolean"]},
                 },
-                "required": ["session_id", "mode", "value_type", "value"],
+                "required": ["session_id", "mode"],
                 "additionalProperties": False,
             },
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
@@ -899,7 +904,7 @@ TOOLS.extend(
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "integer", "minimum": 1},
-                    "offset": {"type": "integer", "minimum": 0, "maximum": 10000, "default": 0},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "default": 0},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
                 },
                 "required": ["session_id"],
@@ -1418,7 +1423,7 @@ TOOLS.extend(
         {
             "name": "memory_scan_base",
             "title": "Scan for pointers to a base or address",
-            "description": "Multi-thread pointer scan for module/base/absolute address. Existing exact one-level search is unchanged when max_depth/max_offset are omitted. Supply max_depth 1..5 or max_offset 0..1048576 to build revalidated module-relative chains (max_results <=1000). Chain mode scans aligned pointers and positive offsets, with explicit partial-results limits; omit start/end to scan selected regions. Use memory_chain_store/batch to save/load returned recipes.",
+            "description": "Multi-thread pointer scan for module/base/absolute address. Existing exact one-level search is unchanged when max_depth/max_offset are omitted. Supply max_depth 1..15 or max_offset 0..1048576 to build revalidated module-relative chains (max_results <=1000). Chain mode scans aligned pointers and positive offsets, with explicit partial-results limits; omit start/end to scan selected regions. Use memory_chain_store/batch to save/load returned recipes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1430,7 +1435,7 @@ TOOLS.extend(
                     "memory_types": MEMORY_REGION_TYPES_SCHEMA,
                     "max_results": {"type": "integer", "minimum": 1, "maximum": 10000, "default": 1000},
                     "workers": {"type": "integer", "minimum": 0, "maximum": 32, "default": 0, "description": "Worker threads; 0 selects an automatic value of at least two."},
-                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "max_depth": {"type": "integer", "minimum": 1, "maximum": 15},
                     "max_offset": {"type": ["string", "integer"], "description": "Maximum positive per-level offset, 0..1048576; enables chain mode."},
                     "budget_mb": {"type": "integer", "minimum": 16, "maximum": 4096, "description": "Chain scan total read budget in MiB (default 512); enables chain mode."},
                     "candidate_limit": {"type": "integer", "minimum": 1024, "maximum": 65536, "description": "Chain candidates per level (default 16384); partial results include stop_reasons."},
@@ -1470,9 +1475,22 @@ TOOLS.extend(render_tools.TOOLS)
 TOOLS.extend(workspace_tools.TOOLS)
 TOOLS.extend(debug_tools.TOOLS)
 TOOLS.extend(logic_tools.TOOLS)
+TOOLS.extend(relationship_tools.TOOLS)
+TOOLS.extend(paused_debug_tools.TOOLS)
+TOOLS.extend(task_tools.TOOLS)
+TOOLS.extend(workflow_tools.TOOLS)
+TOOL_BY_NAME = {tool["name"].lower(): tool for tool in TOOLS}
 
 
 def tool_features(name: str) -> tuple[str, ...]:
+    if name in workflow_tools.BY_NAME:
+        return workflow_tools.features(name)
+    if name in task_tools.BY_NAME:
+        return task_tools.features(name)
+    if name in paused_debug_tools.BY_NAME:
+        return paused_debug_tools.features(name)
+    if name in relationship_tools.BY_NAME:
+        return relationship_tools.features(name)
     if name in logic_tools.BY_NAME:
         return logic_tools.features(name)
     if name in debug_tools.BY_NAME:
@@ -1526,6 +1544,54 @@ def tool_features(name: str) -> tuple[str, ...]:
     if name in {"debug_help", "runtime_capabilities", "raw_hook_call"}:
         return ("diagnostics",)
     return ("connection",)
+
+
+def raw_command_features(native_name: str) -> tuple[str, ...]:
+    """Conservative feature classification for the raw native escape hatch."""
+    native_name = native_name.upper()
+    # Exact extension protocols must run before workspace_tools' generic
+    # WORKSPACE_* fallback.
+    exact = (logic_tools.native_features(native_name) or debug_tools.native_features(native_name) or
+             relationship_tools.native_features(native_name) or paused_debug_tools.native_features(native_name) or
+             task_tools.native_features(native_name) or workflow_tools.native_features(native_name) or
+             workspace_tools.native_features(native_name))
+    if exact is not None:
+        return exact
+    if native_name.startswith(("RENDER_", "OVERLAY_")):
+        return render_tools.native_features(native_name)
+    if native_name.startswith("IL2CPP_"):
+        if native_name in {"IL2CPP_HOOK", "IL2CPP_HOOK_RETURN", "IL2CPP_UNHOOK"}:
+            return ("il2cpp_metadata", "il2cpp_hook")
+        if native_name == "IL2CPP_INVOKE":
+            return ("il2cpp_metadata", "il2cpp_invoke")
+        if native_name == "IL2CPP_OBJECT_INSPECT":
+            return ("il2cpp_metadata", "il2cpp_objects")
+        if native_name in {"IL2CPP_LIST_ITEMS", "IL2CPP_DICTIONARY_GET"}:
+            return ("il2cpp_metadata", "il2cpp_invoke", "il2cpp_objects")
+        return ("il2cpp_metadata",)
+    if native_name.startswith("MEMORY_"):
+        if native_name == "MEMORY_READ":
+            return ("memory_read",)
+        if native_name == "MEMORY_WRITE":
+            return ("memory_write",)
+        if native_name == "MEMORY_POINTER_SCAN_MT":
+            return ("memory_maps", "memory_search", "pointer_chain")
+        if native_name.startswith("MEMORY_SEARCH") or native_name == "MEMORY_FILTER":
+            return ("memory_search",)
+        return ("memory_maps",)
+    if native_name.startswith("DOBBY_"):
+        return ("dobby", "trace") if "TRACE" in native_name or native_name == "DOBBY_INSTRUMENT" else ("dobby",)
+    if native_name.startswith("BREAKPOINT_"):
+        return ("breakpoint",)
+    if native_name.startswith("LUA_"):
+        return ("lua",)
+    if native_name.startswith("ASM_"):
+        if native_name == "ASM_PATCH":
+            return ("assembly", "memory_write")
+        return ("assembly", "memory_read") if native_name == "ASM_DISASSEMBLE" else ("assembly",)
+    if native_name.startswith("DECOMP_"):
+        return ("decompiler", "memory_read") if native_name == "DECOMP_DECOMPILE" else ("decompiler",)
+    return ("diagnostics",)
 
 
 def tools_for_registry(registry: FeatureRegistry) -> list[dict[str, Any]]:
@@ -1771,6 +1837,14 @@ class ToolDispatcher:
             method = lambda args: self._workspace_call(name, args)
         if name in logic_tools.BY_NAME:
             method = lambda args: self._logic_call(name, args)
+        if name in relationship_tools.BY_NAME:
+            method = lambda args: self._relationship_call(name, args)
+        if name in paused_debug_tools.BY_NAME:
+            method = lambda args: self._paused_debug_call(name, args)
+        if name in task_tools.BY_NAME:
+            method = lambda args: self._task_call(name, args)
+        if name in workflow_tools.BY_NAME:
+            method = lambda args: self._workflow_call(name, args)
         if method is None:
             raise BridgeError(f"unknown tool: {name}")
         if not isinstance(arguments, dict):
@@ -1797,11 +1871,56 @@ class ToolDispatcher:
             raise BridgeError(str(exc)) from exc
         return self._json_call(command)
 
+    def _relationship_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = relationship_tools.encode(name, arguments)
+            required = relationship_tools.extra_features(name, arguments)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            raise BridgeError(str(exc)) from exc
+        disabled = sorted(feature for feature in required if not self.registry.enabled(feature))
+        if disabled:
+            raise BridgeError("relationship operation depends on disabled MCP features: " + ", ".join(disabled))
+        return self._json_call(command, timeout=max(self.config.timeout, 15.0))
+
+    def _paused_debug_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = paused_debug_tools.encode(name, arguments)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            raise BridgeError(str(exc)) from exc
+        return self._json_call(command, timeout=max(self.config.timeout, 30.0))
+
+    def _task_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = task_tools.encode(name, arguments)
+            required = task_tools.extra_features(name, arguments)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            raise BridgeError(str(exc)) from exc
+        disabled = sorted(feature for feature in required if not self.registry.enabled(feature))
+        if disabled:
+            raise BridgeError("background task depends on disabled MCP features: " + ", ".join(disabled))
+        return self._json_call(command)
+
+    def _workflow_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            command = workflow_tools.encode(name, arguments)
+            required = workflow_tools.extra_features(name, arguments)
+        except (ValueError, OverflowError, RecursionError) as exc:
+            raise BridgeError(str(exc)) from exc
+        disabled = sorted(feature for feature in required if not self.registry.enabled(feature))
+        if disabled:
+            raise BridgeError("workflow operation depends on disabled MCP features: " + ", ".join(disabled))
+        # Root journal I/O has a 30-second bounded transport timeout; include
+        # room for command intent/outcome persistence around explicit exports.
+        minimum_timeout = 60.0 if name in {"journal_status", "journal_query", "journal_export", "diagnostic_export"} else 30.0
+        return self._json_call(command, timeout=max(self.config.timeout, minimum_timeout))
+
     def _debug_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
             command = debug_tools.encode(name, arguments)
         except (ValueError, OverflowError) as exc:
             raise BridgeError(str(exc)) from exc
+        if name in {"memory_search_tabs", "memory_batch_edit"}:
+            return self._json_call(command, timeout=max(self.config.timeout, 75.0))
         return self._json_call(command)
 
     def _render_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1968,45 +2087,7 @@ class ToolDispatcher:
         native_name = command.split(None, 1)[0].upper()
         if native_name == "MCP_QUERY_V1":
             raise BridgeError("MCP_QUERY_V1 is an internal envelope; call the IL2CPP metadata tool or its original native command")
-        workspace_features = logic_tools.native_features(native_name) or debug_tools.native_features(native_name) or workspace_tools.native_features(native_name)
-        if workspace_features is not None:
-            raw_features = workspace_features
-        elif native_name.startswith(("RENDER_", "OVERLAY_")):
-            raw_features = render_tools.native_features(native_name)
-        elif native_name.startswith("IL2CPP_"):
-            if native_name in {"IL2CPP_HOOK", "IL2CPP_HOOK_RETURN", "IL2CPP_UNHOOK"}:
-                raw_features = ("il2cpp_metadata", "il2cpp_hook")
-            elif native_name == "IL2CPP_INVOKE":
-                raw_features = ("il2cpp_metadata", "il2cpp_invoke")
-            elif native_name == "IL2CPP_OBJECT_INSPECT":
-                raw_features = ("il2cpp_metadata", "il2cpp_objects")
-            elif native_name in {"IL2CPP_LIST_ITEMS", "IL2CPP_DICTIONARY_GET"}:
-                raw_features = ("il2cpp_metadata", "il2cpp_invoke", "il2cpp_objects")
-            else:
-                raw_features = ("il2cpp_metadata",)
-        elif native_name.startswith("MEMORY_"):
-            if native_name == "MEMORY_READ":
-                raw_features = ("memory_read",)
-            elif native_name == "MEMORY_WRITE":
-                raw_features = ("memory_write",)
-            elif native_name == "MEMORY_POINTER_SCAN_MT":
-                raw_features = ("memory_maps", "memory_search", "pointer_chain")
-            elif native_name.startswith("MEMORY_SEARCH") or native_name == "MEMORY_FILTER":
-                raw_features = ("memory_search",)
-            else:
-                raw_features = ("memory_maps",)
-        elif native_name.startswith("DOBBY_"):
-            raw_features = ("dobby", "trace") if "TRACE" in native_name or native_name == "DOBBY_INSTRUMENT" else ("dobby",)
-        elif native_name.startswith("BREAKPOINT_"):
-            raw_features = ("breakpoint",)
-        elif native_name.startswith("LUA_"):
-            raw_features = ("lua",)
-        elif native_name.startswith("ASM_"):
-            raw_features = ("assembly",)
-        elif native_name.startswith("DECOMP_"):
-            raw_features = ("decompiler",)
-        else:
-            raw_features = ("diagnostics",)
+        raw_features = raw_command_features(native_name)
         disabled = [feature for feature in raw_features if not self.registry.enabled(feature)]
         if disabled:
             raise BridgeError(
@@ -2610,7 +2691,7 @@ class ToolDispatcher:
             start = self._address(args["start"], "start")
             end = self._address(args["end"], "end")
         if chain_mode:
-            depth = self._bounded_integer(args.get("max_depth", 3), "max_depth", 1, 5)
+            depth = self._bounded_integer(args.get("max_depth", 3), "max_depth", 1, 15)
             max_offset = self._signed_offset(args.get("max_offset", 4096), "max_offset")
             if not 0 <= max_offset <= 1048576 or max_results > 1000:
                 raise BridgeError("chain mode requires max_offset 0..1048576 and max_results <=1000")
@@ -2719,6 +2800,35 @@ class ToolDispatcher:
             raise BridgeError("value_types must be a non-empty array")
         if len(value_types) > len(MEMORY_VALUE_FORMATS):
             raise BridgeError("too many value_types")
+        if any(not isinstance(item, str) for item in value_types):
+            raise BridgeError("value_types must contain type names")
+        raw = args.get("value")
+        if not isinstance(raw, (str, int, float, bool)) or (isinstance(raw, float) and not math.isfinite(raw)):
+            raise BridgeError("value must be text or a finite number/boolean")
+        expression = isinstance(raw, str) and (any(c in raw for c in ";~:") or (bool(raw) and raw[-1:] in "BWDQFE" and not raw.lower().startswith("0x")))
+        advanced = expression or any(t in {"hex", "utf8", "utf16"} for t in value_types) or "scan_mb" in args or "timeout_ms" in args
+        if advanced:
+            types = []
+            for item in value_types:
+                if item in {"hex", "utf8", "utf16"}: kind = item
+                else:
+                    kind, _ = self._memory_value_format(item)
+                    kind = {"ptr32": "u32", "ptr64": "u64"}.get(kind, kind)
+                if kind not in types: types.append(kind)
+            value = ("true" if raw else "false") if isinstance(raw, bool) else str(raw)
+            if isinstance(raw, float) and raw.is_integer(): value = str(int(raw))
+            query = {"mode": "exact", "types": types, "value": value,
+                     "regions": self._memory_region_types(args), "max_results": args.get("max_results", 1024)}
+            for key in ("alignment", "scan_mb", "timeout_ms"):
+                if key in args: query[key] = args[key]
+            if any(key in args for key in ("module_name", "start_address", "end_address")):
+                query["start"], query["end"] = self._memory_search_range(args)
+            try:
+                render_tools.validate(query, debug_tools.SEARCH_QUERY, "query")
+            except ValueError as exc: raise BridgeError(str(exc)) from exc
+            result = self._json_call("MEMORY_SEARCH_TYPED " + workspace_tools._json(query, 16384), timeout=max(self.config.timeout, 75.0))
+            searches = result.get("sessions", [])
+            return {**result, "exact": True, "searches": searches, "search_count": len(searches)}
         searches: list[dict[str, Any]] = []
         seen: set[str] = set()
         common = {key: value for key, value in args.items() if key not in {"value_types", "value"}}
@@ -2773,8 +2883,21 @@ class ToolDispatcher:
 
     def memory_filter_value(self, args: dict[str, Any]) -> dict[str, Any]:
         mode = _single_line(args.get("mode", ""), "mode")
-        if mode not in {"equals", "not_equals"}:
-            raise BridgeError("typed value filtering supports equals or not_equals")
+        comparisons = {"equals", "not_equals", "greater", "less", "increased_by", "decreased_by"}
+        if mode not in comparisons | {"changed", "unchanged", "increased", "decreased"}:
+            raise BridgeError("unsupported typed filter mode")
+        if (mode in comparisons) != ("value" in args):
+            raise BridgeError("value is required only for comparison/delta filtering")
+        raw = args.get("value", "")
+        expression = isinstance(raw, str) and (any(c in raw for c in ";~:") or (bool(raw) and raw[-1:] in "BWDQFE" and not raw.lower().startswith("0x")))
+        if "value_type" not in args or expression or mode not in {"equals", "not_equals"}:
+            session = self._bounded_integer(args.get("session_id"), "session_id", 1, (1 << 64) - 1)
+            if not isinstance(raw, (str, int, float, bool)) or (isinstance(raw, float) and not math.isfinite(raw)):
+                raise BridgeError("value must be text or a finite number/boolean")
+            value = ("true" if raw else "false") if isinstance(raw, bool) else str(raw)
+            if isinstance(raw, float) and raw.is_integer(): value = str(int(raw))
+            if len(value.encode("utf-8")) > 2048: raise BridgeError("filter value too long")
+            return self._json_call(f"MEMORY_FILTER_TYPED {session} {mode} {self._hex_text(value)}", timeout=max(self.config.timeout, 75.0))
         kind, _ = self._memory_value_format(args.get("value_type"))
         pattern, normalized_value = self._encode_memory_value(kind, args.get("value"))
         result = self.memory_filter(
@@ -2792,7 +2915,7 @@ class ToolDispatcher:
         session_id = self._bounded_integer(
             args.get("session_id"), "session_id", 1, (1 << 64) - 1
         )
-        offset = self._bounded_integer(args.get("offset", 0), "offset", 0, 10000)
+        offset = self._bounded_integer(args.get("offset", 0), "offset", 0, 100000)
         limit = self._bounded_integer(args.get("limit", 100), "limit", 1, 1000)
         return self._json_call(f"MEMORY_SEARCH_RESULTS {session_id} {offset} {limit}")
 
@@ -2873,24 +2996,23 @@ class ToolDispatcher:
         return self._json_call("DOBBY_LIST_HOOKS")
 
     def debug_help(self, args: dict[str, Any]) -> dict[str, Any]:
-        topic = args.get("command", "")
-        if isinstance(topic, str) and topic.lower() in workspace_tools.BY_NAME:
-            name = topic.lower()
-            self.registry.require(name)
-            tool = workspace_tools.BY_NAME[name]
-            return {"tool": name, "description": tool["description"], "inputSchema": tool["inputSchema"], "source": "local_mcp_catalog"}
         requested = _single_line(args.get("command", ""), "command").strip()
-        if requested:
-            requested_lower = requested.lower()
-            for tool in tools_for_registry(self.registry):
-                if tool["name"].lower() == requested_lower:
-                    return {
-                        "tool": tool["name"],
-                        "title": tool.get("title"),
-                        "description": tool.get("description"),
-                        "inputSchema": tool.get("inputSchema", EMPTY_SCHEMA),
-                        "features": list(tool_features(tool["name"])),
-                    }
+        if not requested:
+            visible = tools_for_registry(self.registry)
+            return {"source": "local_mcp_catalog", "tools": [
+                {"name": tool["name"], "features": list(tool_features(tool["name"]))}
+                for tool in visible
+            ], "hint": "debug_help(command=<tool name>) returns its description and schema"}
+        tool = TOOL_BY_NAME.get(requested.lower())
+        if tool is not None:
+            self.registry.require(tool["name"])
+            return {
+                "tool": tool["name"], "title": tool.get("title"),
+                "description": tool.get("description"),
+                "inputSchema": tool.get("inputSchema", EMPTY_SCHEMA),
+                "features": list(tool_features(tool["name"])),
+                "source": "local_mcp_catalog",
+            }
         command = requested.upper()
         aliases = {
             "MEMORY_SEARCH_FUZZY": "MEMORY_SEARCH_FUZZY",
@@ -2923,7 +3045,10 @@ class ToolDispatcher:
             "DEBUG_HELP": "HELP",
         }
         command = aliases.get(command, command)
-        return self._json_call("HELP" + (f" {command}" if command else ""))
+        disabled = [feature for feature in raw_command_features(command) if not self.registry.enabled(feature)]
+        if disabled:
+            raise BridgeError(f"help topic {command} is disabled by MCP feature: {', '.join(disabled)}")
+        return self._json_call(f"HELP {command}")
 
     def runtime_capabilities(self, _: dict[str, Any]) -> dict[str, Any]:
         return self._json_call("CAPABILITIES")

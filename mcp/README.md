@@ -20,6 +20,7 @@ python mcp/mcp_server.py --port 27184 --direct
 
 仅在建立连接失败时自动转发并重试；连接后发生超时/断开不会自动重放命令。目标重启后需重新解析运行时地址。
 
+后续原生加固：方法查询可自动回传执行阶段，断开时 MCP 错误中包含 `last_native_stage`，无需手工抓 logcat。此项需要新版模块配合；旧模块仍按原查询协议工作。。
 
 MCP 还会启动独立的浏览器控制页面，默认地址是 `http://127.0.0.1:27185/`。所有功能开关第一次启动时全部开启，页面修改会立即影响 `tools/list` 并保存到 `mcp_features.json`。可用参数：
 
@@ -117,6 +118,15 @@ files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 
 类型流程图、冻结/追踪管理、多层基址链、批量加载。流程图使用 `il2cpp_type_graph`；已有 Dump、对象检查器和 `memory_scan_base` 均直接扩展，无重复同义工具。
 
+### 多类型关系链
+
+- `il2cpp_relation_selection`：创建和维护命名选择集，可分批追加任意多个精确类/字段；修改使用 `revision` 防止覆盖并发修改。
+- `il2cpp_relation_find`：按 `any`、`all` 或 `ordered` 搜索有界关系路径/网络；中间可经过未选择类型，达到预算会返回 `complete=false` 和 `stop_reasons`。
+- `il2cpp_relation_results`：分页读取路径、节点、边和选择器映射。字段偏移是符号偏移，不是绝对地址。
+- `il2cpp_relation_resolve`：从实时根对象或现有模块/指针链配方，在游戏帧中校验并加载一条可解引用路径；通过 `workspace_result` 轮询完成结果。
+
+`ordered` 模式中，首个选择器带 `field` 时会约束第一条边，例如 `World.player`；后续选择器带字段时表示精确终点，例如 `Player.health`，标量字段也可以作为终点。因此可表达并验证 `World.player(+0x18) → Player.health(+0x704)`，实际偏移来自当前运行时元数据。返回节点中的类、字段、`storage_address`、引用对象、标量和渲染资格，可分别交给已有类型窗口、`workspace_navigate`、内存编辑/冻结与渲染工具处理；解析工具本身不写内存、不调用 getter、构造器或任意方法。
+
 ## Java 层对象渲染与 ImGui 控制
 
 原有 38 个渲染/UI 工具继续保留，新增 33 个工作台与高级 UI 工具，共 71 个；接入默认开启的原有功能组，Lua 程序还依赖 `lua`。浏览器管理接口仍不暴露给 Agent。
@@ -135,7 +145,7 @@ files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 
 显示走已有 Java SurfaceView，不 Hook EGL。Java 菜单启动后自动探测已加载 IL2CPP 的 MonoBehaviour 帧方法；检查 `render_binding_status` 的 automatic/auto_error/automatic_probes、thread_id 和 age_ms。探测失败保留普通内存/类型工具；先解除自动探针后仍可通过 `render_bind_update` 手动绑定。`render_find_objects` 返回受理状态，需要轮询结果。普通目标可提供手动坐标、骨骼和相机矩阵；对象操作只改变可视化，不销毁或移动游戏对象。
 
-每条命令可通过 `debug_help` 查询；完整示例和兼容限制见。新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
+每条命令可通过 `debug_help` 查询；新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
 
 矩阵被裁剪时使用 WorldToScreenPoint；此模式的 `render_project` 返回 pending/request_id，通过 `render_projection_result` 获取结果。所有 Unity 投影仍在游戏帧执行。
 
@@ -177,13 +187,13 @@ files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 
 类型化调用支持 `bool`、`i8`、`u8`、`i16`、`u16`、`i32`、`u32`、`i64`、`u64`、`f32`、`f64`、`ptr32` 和 `ptr64`。指针类型需要按目标进程 ABI 选择；整数和指针写入值可使用 `0x...` 字符串。
 
-指针链从 `module load_bias + base_offset` 或 `base_address + base_offset` 开始。每个 `offsets` 元素执行“读取当前指针，再加该有符号 Offset”；结果返回全部中间步骤。基址扫描的 `workers=0` 自动选择至少 2 个、最多 32 个线程，也可显式指定；分片读取统一使用可并行的 KittyMemory，字节匹配使用 KittyScanner。
+指针链从 `module load_bias + base_offset` 或 `base_address + base_offset` 开始。每个 `offsets` 元素执行“读取当前指针，再加该有符号 Offset”；结果返回全部中间步骤。基址扫描的 `workers=0` 自动选择至少 2 个、最多 32 个线程，也可显式指定。默认 KittyMemory 可并行读取，选择驱动时读取在 Root 通道中串行转发；字节匹配使用 KittyScanner。
 
-这些工具不依赖 IL2CPP 初始化，可用于普通 Native、Mono 或其他引擎进程。所有目标内存读写经 KittyMemory 的严格 `Normal` syscall 模式；只接受完整传输，不跳过不可读页填充伪造数据。扫描在有上限的本地快照上进行，保留 nibble 通配符、对齐和区域多选。模糊搜索/数值过滤继续保留已有会话语义。
+这些工具不依赖 IL2CPP 初始化，可用于普通 Native、Mono 或其他引擎进程。默认数据读写经 KittyMemory 的严格 `Normal` syscall 模式，也可通过 WebUI 选择外部驱动；只接受完整传输，不以不可读页的伪造数据参与搜索。扫描在有上限的本地快照上进行，保留 nibble 通配符、对齐和区域多选。
 
-### 内核驱动已停用
+### 外部 Root 内核驱动
 
-WebUI 不再提供驱动选择或节点输入；旧驱动配置不加载，KMA 驱动库不参与链接。`memory_backend_status` 返回 `backend: kittymemory`、`drivers_enabled: false`。32/64 位共享该路径；访问失败只使当前请求失败，不切回驱动。
+WebUI 恢复驱动和设备节点设置，保存后重启目标。驱动由外部 Root companion 打开并仅对固定目标 PID 读写；不在注入进程直接打开。`memory_backend_status` 报告后端、transport、state、reason；`unprobed` 表示尚未读写验证，`drivers_enabled:true` 只表示允许选择驱动。KMA 库存在时按 ARM64 条件链接；其他 ABI 使用默认 KittyMemory。
 
 代码补丁也使用 KittyMemory，临时开放所需页的写权限、写入、恢复权限并刷新指令缓存。Dobby 仍负责安装/解除 Hook 和自己的 trampoline 内部操作；`dobby_patch_code` 保留旧名称以兼容客户端，但不再调用 DobbyCodePatch。
 
@@ -198,6 +208,12 @@ WebUI 不再提供驱动选择或节点输入；旧驱动配置不加载，KMA �
 返回值包含模块整体 `start`/`end`，以及每个 region 的 `start`、`end`、`permissions`、文件 `offset` 和 `path`。
 
 ### 搜索和过滤
+
+新增 `memory_search_tabs`：管理独立搜索标签、精确/模糊/联合搜索、改善、结果分页、多选、保存项及文件/剪贴板导出。新增 `memory_batch_edit`：对 1–256 个已选结果或明确保存项进行批量写入/冻结，必须 `confirm:true`，非原子操作、失败即停止。冻结管理复用 `memory_freeze_*`，不增加重复工具。
+
+`memory_search_exact` 新增 `100;200:512` 无序组、`100;200::512` 有序组、`10~20` 范围及混合类型后缀，支持 hex/UTF-8/UTF-16 搜索；高级搜索返回 `sessions` 和兼容的 `searches`。`memory_filter_value` 省略 `value_type` 时按原生结果类型改善，支持变化、大小比较和指定增减值；原普通数值等于/不等于调用保留。`memory_search_results` 支持至 100000 的 offset。请检查 `truncated/stop_reason`，导出的“全部”仅指全部缓存候选。
+
+手动页面和 MCP 使用相同状态。使用 `debug_help` 查看完整参数；断点的 PC/整数寄存器快照和回溯已由 `breakpoint_hits` / `breakpoint_backtrace` 返回，属于采样而非暂停式调试。
 
 按模块搜索机器码特征：
 
@@ -225,6 +241,22 @@ WebUI 不再提供驱动选择或节点输入；旧驱动配置不加载，KMA �
 
 每次过滤后会更新保留结果的快照。最多同时保存 16 个搜索会话，超过后自动替换最旧会话；单次最多扫描 512 MiB、返回 10000 个地址，特征长度最多 256 字节。`memory_types` 可多选 `anonymous`、`heap`、`stack`、`app_code`、`system_code`、`app_data`、`ashmem`、`java` 和 `other`。
 
+## 持久日志与调试工作流
+
+- `journal_status`：查询 Root 持久日志、当前精确会话文件、异步队列和写入失败计数，不创建或清理日志。
+- `journal_query`：列出会话文件或按字节游标分页读取单个精确会话；一次调用有扫描和返回大小上限，需要按 `next_cursor` 继续。
+- `journal_export`：把一个会话复制到 Root 管理的目标隔离目录 `/data/adb/zygisk_il2cpp_mcp/journal/<target>/exports/`，只返回回执、路径和字节数。
+- `diagnostic_export`：在同一 Root 导出目录生成有界诊断 JSON，包含日志尾部、模块、后端和系统摘要；不包含原始内存、全系统 logcat 或 tombstone。
+- `debug_project`：维护按目标及版本隔离的持久调试项目，支持 list/create/get/update/archive/summary/export。项目只保存符号配置、任务、发现、书签、产物和笔记，不自动重放调用，也不把跨重启的实时地址视为仍有效。
+- `debug_snapshot`：捕获对象、List、Dictionary 或一段已校验内存，支持 list/get/diff/export。IL2CPP 捕获在游戏帧中有界执行；它不是全进程一致性快照。跨会话/目标比较必须显式设置 `allow_cross_session=true`。
+- `workspace_jobs`：统一查看手动 UI 与 MCP 的会话内后台任务，并可提交严格白名单中的只读命令、查询结果或协作取消。提交成功只表示受理；`cancel_requested` 也不等于已经取消。它不终止线程，不接受写入、Lua、调用、嵌套工作区命令或任意 PID。
+- `change_history`：分页读取变更记录、导出或尝试撤销一条当前会话记录。撤销要求精确 session、`confirm=true`，并重新核对后端、映射、当前字节和冻结冲突。
+- `debug_stop_all`：在 `confirm=true` 后尽力恢复调试器拥有的暂停线程并停止/暂停冻结、追踪、采样断点、Frida、原生逻辑和 UI 程序。它与撤销分开，不恢复内存、不撤销已调用方法，也不保证回滚任意 Hook 副作用。
+
+命令日志和 change journal 都不是事务审计。change journal 明确是 best-effort：记录/持久化失败时原始内存写入或代码 Patch 仍可继续，因此缺少记录不能证明写入没有发生。只有成功记录且当前环境仍完全匹配的改动才可能由 `change_history(op=undo)` 撤销。
+
+对象快照的 `next_offset/has_more` 用于跨嵌套对象继续捕获，跳页不会跳过引用发现；每页是一次新的有界捕获，不是同一瞬间的全图快照。List／Dictionary 回执保留实际类型。内存差异比较最多 65536 字节，按数值偏移排序，兼容旧快照格式，`diff` 的 `offset` 可到 65536。项目／快照 `export` 只返回成功状态、文件路径和字节数，不返回完整文档。
+
 ## LuaJIT tools
 
 - `lua_status`：只查询状态，不创建 VM。
@@ -244,6 +276,20 @@ WebUI 不再提供驱动选择或节点输入；旧驱动配置不加载，KMA �
 
 汇编、反汇编与硬件断点当前是 ARM64 能力。ARM32 或禁止 `perf_event_open` 的内核会返回明确的 unsupported/failed 原因，其他 MCP tools 仍正常使用。
 
+### 外部暂停调试器
+
+暂停调试器由目标进程外的 Root companion 执行，只允许启动时已绑定的目标 PID，与上面的 perf 采样断点互相独立：
+
+- `debugger_status`：查询 ARM64 支持、拥有的暂停线程、租约和清理状态；状态可用不代表 ptrace 权限已经通过，权限只在实际暂停时确认。
+- `debugger_threads`：分页枚举固定目标的线程，同时返回用于抵抗 TID 重用的 `thread_start_time`；当前请求线程不能由此通道暂停。
+- `debugger_control`：pause/resume/resume_all/step/set_registers/renew/help。暂停必须提交 TID、匹配的启动时间和 `confirm=true`；租约范围 1–15 秒，过期、Broker 断线或所有者退出会触发清理。
+- `debugger_registers`：只读取调试器已拥有并停止的线程，返回 X0–X30、SP、PC、PSTATE、`stop_id` 与剩余租约；读取不会续租。
+- `debugger_backtrace`：读取最多 64 帧的 ARM64 帧指针回溯，并报告不完整原因；省略帧指针或 PAC 可能提前终止。
+
+`step` 和寄存器写入要求当前 `stop_id`，写 PC/SP 还会检查执行/写映射及对齐。当前不提供按地址停止断点、step-over/step-out、FP/SIMD/SVE 寄存器、信号抑制或任意 PID 附加。暂停一个线程时其他线程仍运行，也可能等待它持有的锁；暂停期间不要发起依赖 Unity 游戏帧或目标锁的调用。传输错误后先查 `debugger_status`，不要盲目重复变更命令。
+
+Root 通道允许传输失败后重新鉴权，但不重放已经发送的操作；变更响应丢失标为结果未知。重连保留暂停清理状态，且不会复用旧 perf 事件 ID 或 `stop_id`。仍持有暂停线程时，Root 日志／驱动操作会返回忙，避免慢磁盘阻塞租约清理；应先恢复线程，再查询日志或导出诊断。
+
 ## Ghidra 反编译
 
 - `decompiler_status`：查询 ARM64 Ghidra Native 引擎、运行时内存读取和 IL2CPP 类型元数据状态。
@@ -259,12 +305,12 @@ WebUI 不再提供驱动选择或节点输入；旧驱动配置不加载，KMA �
 
 `logic_program_schema/validate/set/list/get/control/remove` 提供独立于 Lua 的通用 JSON 逻辑运行时。AI 通过 MCP 查询语法并提交变量、条件、遍历、动态对象源、字段读取及绘制/UI 变量输出；目标游戏的字段、筛选规则和窗口布局由调用方下发，底层不预装业务程序。
 
-原生界面的“AI 逻辑”页可编辑、校验、启停和查看诊断。设置 `auto_start=true` 后保存 `default` 工作区预设，可在下次启动重新解析对象源。当前不支持原生逻辑中的方法调用、字段写入或 Hook。语言和恢复语义。
+原生界面的“AI 逻辑”页可编辑、校验、启停和查看诊断。设置 `auto_start=true` 后保存 `default` 工作区预设，可在下次启动重新解析对象源。当前不支持原生逻辑中的方法调用、字段写入或 Hook。
 
 ## Help 与兼容性
 
 - `runtime_capabilities`：一次返回内存后端、LuaJIT、汇编、断点、Dobby 与 IL2CPP 的独立状态，不会提前初始化可选能力。
-- `debug_help`：传 MCP 工具名时直接返回该工具的说明、Schema 和功能组；不传时列出定制原生命令，传原生命令时返回 usage。
+- `debug_help`：传 MCP 工具名时返回本地说明、Schema、来源和功能组，并遵从功能开关；不传时只列出当前对 Agent 可见的 MCP 工具。传未知于 MCP 目录但受支持的原生命令主题时，应用相同功能门控后返回原生 usage，不能用 HELP 绕过已禁用能力。
 
 ## JNI Toast tools
 

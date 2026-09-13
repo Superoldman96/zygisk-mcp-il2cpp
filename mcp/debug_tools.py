@@ -12,6 +12,12 @@ TYPE_SELECTION = {"image": {**w.TEXT, "maxLength": 512},
                   "namespace": {**w.TEXT, "maxLength": 512},
                   "class_name": {"type": "string", "minLength": 1, "maxLength": 512}}
 VALUE_TYPES = r.enum("bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "hex")
+SEARCH_TYPES = r.enum("bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64", "hex", "utf8", "utf16")
+SEARCH_QUERY = w.obj({"mode": r.enum("exact", "fuzzy"), "types": w.array(SEARCH_TYPES, 8, 1),
+    "value": {"type": "string", "maxLength": 2048}, "regions": {"type": "string", "minLength": 1, "maxLength": 256},
+    "start": w.ADDRESS, "end": w.ADDRESS, "max_results": w.integer(1, 100000),
+    "scan_mb": w.integer(1, 512), "timeout_ms": w.integer(100, 60000), "alignment": w.integer(1, 4096)})
+ROW_IDS = w.array({"type": "string", "minLength": 1, "maxLength": 128}, 1000)
 OFFSET = {"type": ["string", "integer"], "maxLength": 32}
 RECIPE = w.obj({"module": {"type": "string", "maxLength": 512, "minLength": 1},
     "occurrence": w.integer(1, 4096), "base_address": r.ADDRESS, "base_offset": OFFSET,
@@ -19,6 +25,16 @@ RECIPE = w.obj({"module": {"type": "string", "maxLength": 512, "minLength": 1},
     "dereference_final": w.B, "value_type": r.enum("bool", "i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"),
     "label": w.TEXT})
 TOOLS = [
+    r.tool("memory_search_tabs", "Shared GG-style memory workspace used by the manual UI and MCP. op=list/create/update/focus/duplicate/remove/clear/search/refine/results/select/save_selection/saved_list/saved_remove/export. Up to 512 independent tabs. create accepts name; duplicate copies query only. All tab ops require tab_id; optional version provides compare-and-swap. search accepts query {types:['i32'],value:'100;200::512',mode:'exact',regions:'anonymous,heap,app_data'}; semicolon=joint, :N unordered span, ::N ordered span, default 512; span counts distance between first bytes + 1. B/W/D/Q/F/E suffixes select signed byte/word/dword/qword/float/double. a~b is inclusive numeric range. hex accepts ?? and nibble wildcards; utf8/utf16 literal text. Search returns ALL witnessed group members, not A OR B. Fuzzy creates a bounded unknown-value snapshot. Refine mode=equals/not_equals/greater/less/changed/unchanged/increased/decreased/increased_by/decreased_by; value required for numeric comparisons. results merges tab sessions with per-row id/type, supports offset/limit/live (live does not change baseline). select: mode=add/remove with ids, or all/none. save_selection copies selected rows to a PROCESS-LOCAL saved list; no automatic replay after restart. export scope=selected/all, source=results/saved, destination=file/clipboard; files return status/path/count only. Reads use the WebUI-selected external root driver or local KittyMemory. Check truncated/stop_reason/read_error; not every GG grammar is supported. No memory writes: use memory_batch_edit or existing freeze tools.", {
+        "op": r.enum("list", "create", "update", "focus", "duplicate", "remove", "clear", "search", "refine", "results", "select", "save_selection", "saved_list", "saved_remove", "export"),
+        "tab_id": w.integer(1, 2**53-1), "version": w.integer(1, 2**53-1), "name": {"type": "string", "minLength": 1, "maxLength": 96},
+        "query": SEARCH_QUERY, "mode": r.enum("equals", "not_equals", "greater", "less", "changed", "unchanged", "increased", "decreased", "increased_by", "decreased_by", "add", "remove", "all", "none"),
+        "value": {"type": "string", "maxLength": 2048}, "offset": w.integer(0, 800000), "limit": w.integer(1, 1000), "live": w.B,
+        "ids": ROW_IDS, "scope": r.enum("selected", "all"), "source": r.enum("results", "saved"), "destination": r.enum("file", "clipboard")}, ("op",)),
+    r.tool("memory_batch_edit", "Write or freeze 1..256 selected memory-workspace rows using the selected data backend. source=results (default) requires tab_id and uses its current selection; source=saved requires explicit saved ids. value is exact text encoded separately for each row type. confirm=true is REQUIRED. Duplicate/overlapping addresses and non-writable/executable mappings are rejected. freeze=true creates/updates existing freeze tasks, interval_ms=20..60000; manage through existing memory_freeze_* tools. Batch is NOT atomic; reports requested/processed/succeeded and per-row errors, stops at first failure without falling back to another backend. Larger selections must be divided explicitly. No arbitrary PID or device-node arguments.", {
+        "tab_id": w.integer(1, 2**53-1), "version": w.integer(1, 2**53-1), "source": r.enum("results", "saved"),
+        "ids": ROW_IDS, "value": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "confirm": w.B, "freeze": w.B, "interval_ms": w.integer(20, 60000)}, ("value", "confirm")),
     r.tool("memory_chain_export", "Export ALL currently cached results from one pointer scan session to a new target-private JSON file, never just the visible/current page. session_id comes from memory_scan_base.search; scan_kind=chains (default) selects a multi-level chain scan, pointers selects legacy exact-pointer candidates. Keeps original scan state, truncated/stop reasons, budgets and actual cached/exported counts in the file. Full export does not make a truncated scan complete. Chain JSON preserves module+offset recipes and recipe_batches reusable as memory_chain_batch arguments. Latest four successful chain sessions are retained; expired/non-pointer sessions fail without rescanning. Atomic unique publication never overwrites user files. Returns success/path/count only, never the file contents or result list.", {
         "session_id": w.integer(1, 2**53-1), "scan_kind": r.enum("chains", "pointers")}, ("session_id",)),
     r.tool("memory_chain_batch", "Resolve/read 1..128 pointer chains or saved IDs. Returns an object with results (per-item success/error), total, succeeded and failed; an item failure does not discard other results. Recipe semantics match memory_resolve_pointer_chain: base+base_offset, then dereference and add each offset; optional final dereference. Values use exact text. Re-resolves modules, never writes memory. No promise of an atomic snapshot. Use existing single-chain tools for one-off calls.", {
@@ -45,6 +61,7 @@ TOOLS = [
         **TYPE_SELECTION, "depth": w.integer(0, 4), "max_nodes": w.integer(1, 128), "method_types": w.B}, readonly=True),
 ]
 BY_NAME = {t["name"]: t for t in TOOLS}
+BY_NAME["memory_batch_edit"]["annotations"]["destructiveHint"] = True
 
 def selection(args: dict[str, Any]) -> dict[str, Any]:
     r.validate(args, w.obj(TYPE_SELECTION), "selection")
@@ -76,6 +93,10 @@ def normalize_recipe(recipe: dict[str, Any], persistent: bool = False) -> dict[s
     return value
 
 def features(name: str) -> tuple[str, ...]:
+    if name == "memory_search_tabs":
+        return ("memory_search", "memory_read")
+    if name == "memory_batch_edit":
+        return ("memory_read", "memory_write")
     if name.startswith("memory_chain_"):
         return ("memory_maps", "memory_read", "pointer_chain")
     if name == "il2cpp_type_graph":
@@ -89,6 +110,8 @@ def features(name: str) -> tuple[str, ...]:
     return ("breakpoint",)
 
 def native_features(command: str) -> tuple[str, ...] | None:
+    if command == "MEMORY_SEARCH_TABS": return features("memory_search_tabs")
+    if command == "MEMORY_BATCH_EDIT": return features("memory_batch_edit")
     if command == "MEMORY_CHAIN_SCAN":
         return ("memory_maps", "memory_search", "pointer_chain")
     if command.startswith("MEMORY_CHAIN_"):
@@ -107,6 +130,55 @@ def native_features(command: str) -> tuple[str, ...] | None:
 
 def encode(name: str, args: dict[str, Any]) -> str:
     r.validate(args, BY_NAME[name]["inputSchema"], "arguments")
+    if name == "memory_batch_edit":
+        if args["confirm"] is not True: raise ValueError("confirm=true is required")
+        if args.get("source", "results") == "saved":
+            if not args.get("ids") or "tab_id" in args or "version" in args: raise ValueError("saved edits require ids, not tab_id/version")
+            if len(args["ids"]) > 256: raise ValueError("at most 256 saved ids per batch")
+        elif "tab_id" not in args or "ids" in args: raise ValueError("result edits require tab_id and use its current selection")
+        return "MEMORY_BATCH_EDIT " + w._json(args, 16384)
+    if name == "memory_search_tabs":
+        op = args["op"]
+        optional = {"list": set(), "create": {"name"}, "update": {"name", "query"}, "focus": set(),
+            "duplicate": set(), "remove": set(), "clear": set(), "search": {"query"}, "refine": {"mode", "value"},
+            "results": {"offset", "limit", "live"}, "select": {"mode", "ids"}, "save_selection": {"name", "scope"},
+            "saved_list": {"offset", "limit", "live"}, "saved_remove": {"ids"}, "export": {"scope", "source", "destination", "ids"}}[op]
+        saved_export = op == "export" and args.get("source") == "saved"
+        needs_tab = op not in {"list", "create", "saved_list", "saved_remove"} and not saved_export
+        permitted = {"op"} | optional | ({"tab_id", "version"} if needs_tab else set())
+        if set(args) - permitted: raise ValueError("arguments not used by " + op)
+        if needs_tab and "tab_id" not in args: raise ValueError("tab_id is required")
+        if op == "refine":
+            modes = {"equals", "not_equals", "greater", "less", "changed", "unchanged", "increased", "decreased", "increased_by", "decreased_by"}
+            if args.get("mode") not in modes: raise ValueError("invalid refine mode")
+            needs_value = args["mode"] in {"equals", "not_equals", "greater", "less", "increased_by", "decreased_by"}
+            if needs_value != ("value" in args): raise ValueError("value is required only for comparison/delta filtering")
+        if op == "select":
+            if args.get("mode") not in {"add", "remove", "all", "none"}: raise ValueError("invalid selection mode")
+            if (args["mode"] in {"add", "remove"}) != ("ids" in args): raise ValueError("add/remove require ids; all/none do not")
+        if op == "saved_remove" and not args.get("ids"): raise ValueError("saved_remove requires ids")
+        if "query" in args:
+            args = dict(args)
+            query = dict(args["query"])
+            args["query"] = query
+            for key in ("start", "end"):
+                if key in query: query[key] = r.address(query[key])
+            if not query.get("types"): raise ValueError("query.types is required")
+            if len(set(query["types"])) != len(query["types"]): raise ValueError("duplicate value types")
+            if "regions" in query and any(x not in {"all", "anonymous", "heap", "stack", "app_code", "system_code", "app_data", "ashmem", "java", "other"} for x in query["regions"].split(",")):
+                raise ValueError("unknown memory region")
+            if "all" in query.get("regions", "").split(",") and query["regions"] != "all": raise ValueError("all must be used alone")
+            if "start" in query and int(query["start"], 16) == 0: raise ValueError("start must be nonzero")
+            if "start" in query and "end" in query and int(query["start"], 16) >= int(query["end"], 16): raise ValueError("end must be greater than start")
+            if query.get("mode", "exact") == "exact" and not query.get("value") and op == "search": raise ValueError("query.value is required for exact search")
+            if query.get("mode") == "fuzzy" and any(t in {"hex", "utf8", "utf16"} for t in query["types"]): raise ValueError("fuzzy requires scalar types")
+        if op == "export":
+            if args.get("source") == "saved":
+                if args.get("scope", "selected") == "selected" and not args.get("ids"):
+                    raise ValueError("selected saved export requires nonempty ids")
+                if args.get("scope") == "all" and "ids" in args: raise ValueError("all saved export does not accept ids")
+            elif "ids" in args: raise ValueError("result export uses tab selection, not ids")
+        return "MEMORY_SEARCH_TABS " + w._json(args, 16384)
     if name == "memory_chain_export":
         return "MEMORY_CHAIN_EXPORT " + w._json({"scan_kind": "chains", **args}, 8192)
     if name == "memory_chain_batch":

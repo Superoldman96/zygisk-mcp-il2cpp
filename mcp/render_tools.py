@@ -37,7 +37,7 @@ UI_FIELDS = {
     "language": enum("zh", "en"), "theme": enum("classic", "dark", "light"),
     "visible": {"type": "boolean"}, "collapsed": {"type": "boolean"},
     "scale": number(.5, 2), "alpha": number(.2, 1),
-    "page_rows": {"type": "integer", "minimum": 1, "maximum": 256},
+    "page_rows": {"type": "integer", "minimum": 1, "maximum": 100000},
     **{key: {"type": "boolean"} for key in ("mcp_log", "trace_log", "breakpoint_log", "browser_split")},
 }
 OBJECT_FIELDS = {
@@ -99,7 +99,7 @@ PRIMITIVE = descriptor({
 
 TOOLS = [
     tool("overlay_status", "Read shared ImGui UI state. Drawing uses the existing Java SurfaceView.", readonly=True),
-    tool("overlay_set", "Set language zh/en, theme classic/dark/light, visible/collapsed boolean, scale .5..2, alpha .2..1, page_rows 1..256, browser_split for side-by-side class browsing, or mcp_log/trace_log/breakpoint_log booleans for transparent on-screen logs. Settings auto-save/load privately. Does not hide world-space object rendering or override the WebUI startup injection switch.", setting_properties(UI_FIELDS), ("key", "value")),
+    tool("overlay_set", "Set language zh/en, theme classic/dark/light, visible/collapsed boolean, scale .5..2, alpha .2..1, page_rows 1..100000 (large memory pages load visible rows on demand; other remote views use bounded batches), browser_split for side-by-side class browsing, or mcp_log/trace_log/breakpoint_log booleans for transparent on-screen logs. Settings auto-save/load privately. Does not hide world-space object rendering or override the WebUI startup injection switch.", setting_properties(UI_FIELDS), ("key", "value")),
     tool("overlay_set_window", "Move/resize native ImGui window in SurfaceView pixels; negative/off-screen positions are allowed without forced display clamping. Native titlebar collapse and resize remain usable.", {"x": number(-32768, 32768), "y": number(-32768, 32768), "width": number(200, 32768), "height": number(200, 32768)}, ("x", "y", "width", "height")),
     tool("overlay_reset", "Restore visible Chinese ImGui Classic purple-theme defaults; does not delete render objects."),
     tool("render_status", "Read styles, camera freshness, optional bones capabilities, queued discovery progress and errors. Missing Unity support never disables manual geometry or ImGui.", readonly=True),
