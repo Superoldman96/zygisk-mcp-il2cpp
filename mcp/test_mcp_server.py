@@ -79,6 +79,7 @@ class McpServerTests(unittest.TestCase):
         self.assertIn("il2cpp_hook", names)
         self.assertIn("il2cpp_hook_return", names)
         self.assertIn("il2cpp_dump_file", names)
+        self.assertIn("il2cpp_unity_catalog", names)
         self.assertIn("memory_read", names)
         self.assertIn("memory_write", names)
         self.assertIn("memory_read_value", names)
@@ -248,6 +249,15 @@ class McpServerTests(unittest.TestCase):
             )
         json_call.assert_called_once_with("IL2CPP_FIELDS 412e646c6c 4e 43 - 1 0 200")
 
+        with patch.object(dispatcher, "_json_call", return_value={"items": []}) as json_call:
+            dispatcher.il2cpp_unity_catalog(
+                {"category": "asset", "query": "Texture", "offset": 10, "limit": 25}
+            )
+        json_call.assert_called_once_with(
+            "IL2CPP_UNITY_CATALOG asset 54657874757265 10 25",
+            timeout=60.0,
+        )
+
     def test_pointer_chain_resolution(self) -> None:
         dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False))
         module = {"load_bias": "0x1000", "start": "0x1100", "end": "0x3000"}
@@ -416,8 +426,12 @@ class McpServerTests(unittest.TestCase):
         )
 
         with patch.object(dispatcher, "_json_call", return_value={"bytes_hex": "1f2003d5"}) as json_call:
-            dispatcher.assembly_assemble({"instruction": "nop"})
-        json_call.assert_called_once_with("ASM_ASSEMBLE 6e6f70")
+            dispatcher.assembly_assemble({"instruction": "nop\nret"})
+        json_call.assert_called_once_with("ASM_ASSEMBLE 6e6f700a726574")
+
+        with patch.object(dispatcher, "_json_call", return_value={"patched": True}) as json_call:
+            dispatcher.assembly_patch({"address": "0x1234", "instruction": "nop\nret"})
+        json_call.assert_called_once_with("ASM_PATCH 0x1234 6e6f700a726574")
 
         with patch.object(dispatcher, "_json_call", return_value={"pseudocode": "void sub_1234() {}"}) as json_call:
             dispatcher.decompile_function({"address": "0x1234"})
@@ -436,6 +450,28 @@ class McpServerTests(unittest.TestCase):
             help_result = dispatcher.debug_help({"command": "assembly_patch"})
         json_call.assert_not_called()
         self.assertEqual("assembly_patch", help_result["tool"])
+
+    def test_decompiler_metadata_requires_explicit_opt_in_and_gate(self) -> None:
+        registry = FeatureRegistry()
+        dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False), registry)
+        with patch.object(dispatcher, "_json_call", return_value={}) as send:
+            dispatcher.decompile_function({"address": "0x1234", "metadata_mode": "resolve_known"})
+            self.assertEqual(send.call_args.args[0], "DECOMP_DECOMPILE 0x1234 256 256 262144 1 1 resolve_known")
+        with patch.object(dispatcher, "_json_call") as send:
+            with self.assertRaisesRegex(BridgeError, "metadata_mode"):
+                dispatcher.decompile_function({"address": "0x1234", "metadata_mode": "scan_all"})
+            send.assert_not_called()
+        registry.set("il2cpp_metadata", False)
+        with patch.object(dispatcher, "_json_call") as send, patch.object(dispatcher, "_client") as client:
+            with self.assertRaisesRegex(BridgeError, "il2cpp_metadata"):
+                dispatcher.decompile_function({"address": "0x1234", "metadata_mode": "resolve_known"})
+            with self.assertRaisesRegex(BridgeError, "il2cpp_metadata"):
+                dispatcher.raw_hook_call({"command": "DECOMP_DECOMPILE 0x1234 256 256 262144 1 1 resolve_known"})
+            send.assert_not_called()
+            client.assert_not_called()
+        with patch.object(dispatcher, "_json_call", return_value={}) as send:
+            dispatcher.decompile_function({"address": "0x1234"})
+            self.assertEqual(send.call_args.args[0], "DECOMP_DECOMPILE 0x1234 256 256 262144 1 1")
 
     def test_new_tool_families_reach_their_exact_wire_commands(self) -> None:
         dispatcher = ToolDispatcher(ConnectionConfig(auto_adb_forward=False))

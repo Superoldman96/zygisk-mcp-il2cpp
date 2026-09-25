@@ -98,7 +98,7 @@ PRIMITIVE = descriptor({
 
 
 TOOLS = [
-    tool("overlay_status", "Read shared ImGui UI state. Drawing uses the existing Java SurfaceView.", readonly=True),
+    tool("overlay_status", "Read shared ImGui UI state. Drawing uses the Java SurfaceView. Newer targets report renderer.touch_events, captured_touch_events, rendered_frames and last_frame_age_ms: compare two samples to distinguish missing input from a stalled renderer. input_route identifies window_callback or java_input_windows (NativeActivity); input_windows and input_error diagnose the independent Java touch windows. These counters contain no touch coordinates or input text.", readonly=True),
     tool("overlay_set", "Set language zh/en, theme classic/dark/light, visible/collapsed boolean, scale .5..2, alpha .2..1, page_rows 1..100000 (large memory pages load visible rows on demand; other remote views use bounded batches), browser_split for side-by-side class browsing, or mcp_log/trace_log/breakpoint_log booleans for transparent on-screen logs. Settings auto-save/load privately. Does not hide world-space object rendering or override the WebUI startup injection switch.", setting_properties(UI_FIELDS), ("key", "value")),
     tool("overlay_set_window", "Move/resize native ImGui window in SurfaceView pixels; negative/off-screen positions are allowed without forced display clamping. Native titlebar collapse and resize remain usable.", {"x": number(-32768, 32768), "y": number(-32768, 32768), "width": number(200, 32768), "height": number(200, 32768)}, ("x", "y", "width", "height")),
     tool("overlay_reset", "Restore visible Chinese ImGui Classic purple-theme defaults; does not delete render objects."),

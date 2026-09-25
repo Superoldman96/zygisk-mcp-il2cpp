@@ -1,5 +1,18 @@
 # Zygisk IL2CPP MCP Bridge
 
+当前服务版本：**2.6.1** · 作者：**洋葱落日 && DUM**
+
+2.6.1 增加自定义 SO 注入／任务状态工具，改进 IL2CPP 关系链短路径搜索、旧版 API 兼容和 AI 逻辑调用。手机模块、MCP 服务和 WebUI 包使用同一版本；更新文件后请重启 MCP 服务，手机原生功能还需更新模块并重启目标。
+
+- `native_library_inject`／`native_library_status`：上传并加载 SO 到已连接目标，支持状态查询与显式 JNI 初始化。
+- `il2cpp_relation_find`：默认 `strategy=shortest`，可选有界 `all_paths`，保留字段偏移与实例导航。
+- `il2cpp_status`：返回旧版类枚举、数组布局及错误诊断，区分支持与已验证状态。
+- `dobby_resolve_symbol`：仅查已加载模块的动态导出，不再扫描磁盘内部符号。
+- `logic_program_*`：自定义函数、有界循环、集合运算与显式开启的带参托管调用。
+- 原有资源、内存、断点、日志与项目工具继续保留；每项用法可通过 `debug_help` 查询。
+
+新兼容路径和复杂加载场景仍需更多设备验证。自定义 SO 会在目标进程执行，不具备反编译工作进程的隔离能力。
+
 这是一个仅依赖 Python 标准库的 stdio MCP Server。它通过 ADB 转发连接目标进程内的本地 Socket，并把 IL2CPP、普通 Native 内存、LuaJIT、Dobby、汇编和断点能力暴露为 MCP tools。
 
 ## Start
@@ -20,7 +33,9 @@ python mcp/mcp_server.py --port 27184 --direct
 
 仅在建立连接失败时自动转发并重试；连接后发生超时/断开不会自动重放命令。目标重启后需重新解析运行时地址。
 
-后续原生加固：方法查询可自动回传执行阶段，断开时 MCP 错误中包含 `last_native_stage`，无需手工抓 logcat。此项需要新版模块配合；旧模块仍按原查询协议工作。。
+2026-09-12 测试反馈修复：指针链批量结果/列表兼容原生数组，输入等待不再阻塞并行推送。此修复仅涉及 MCP Python，更新正在使用的 `mcp` 目录并重启 MCP 进程即可，无需为这几项重新编译或刷入模块。
+
+方法查询诊断：方法查询可自动回传执行阶段，断开时 MCP 错误中包含 `last_native_stage`，无需手工抓 logcat。此项需要新版模块配合；旧模块仍按原查询协议工作。ImGui 注入开关、工作台布局及兼容边界。
 
 MCP 还会启动独立的浏览器控制页面，默认地址是 `http://127.0.0.1:27185/`。所有功能开关第一次启动时全部开启，页面修改会立即影响 `tools/list` 并保存到 `mcp_features.json`。可用参数：
 
@@ -145,7 +160,7 @@ files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 
 显示走已有 Java SurfaceView，不 Hook EGL。Java 菜单启动后自动探测已加载 IL2CPP 的 MonoBehaviour 帧方法；检查 `render_binding_status` 的 automatic/auto_error/automatic_probes、thread_id 和 age_ms。探测失败保留普通内存/类型工具；先解除自动探针后仍可通过 `render_bind_update` 手动绑定。`render_find_objects` 返回受理状态，需要轮询结果。普通目标可提供手动坐标、骨骼和相机矩阵；对象操作只改变可视化，不销毁或移动游戏对象。
 
-每条命令可通过 `debug_help` 查询；新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
+每条命令可通过 `debug_help` 查询。新工具需要同时更新设备模块与整个 MCP 目录（包括 `render_tools.py`），不能只替换 `mcp_server.py`。
 
 矩阵被裁剪时使用 WorldToScreenPoint；此模式的 `render_project` 返回 pending/request_id，通过 `render_projection_result` 获取结果。所有 Unity 投影仍在游戏帧执行。
 
@@ -193,7 +208,7 @@ files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs
 
 ### 外部 Root 内核驱动
 
-WebUI 恢复驱动和设备节点设置，保存后重启目标。驱动由外部 Root companion 打开并仅对固定目标 PID 读写；不在注入进程直接打开。`memory_backend_status` 报告后端、transport、state、reason；`unprobed` 表示尚未读写验证，`drivers_enabled:true` 只表示允许选择驱动。KMA 库存在时按 ARM64 条件链接；其他 ABI 使用默认 KittyMemory。
+WebUI 恢复驱动和设备节点设置，保存后重启目标。驱动由外部 Root companion 打开并仅对固定目标 PID 读写；不在注入进程直接打开。`memory_backend_status` 报告后端、transport、state、reason；`unprobed` 表示尚未读写验证，`drivers_enabled:true` 只表示允许选择驱动。KMA 库存在时按 ARM64 条件链接；其他 ABI 使用默认 KittyMemory。失败不静默切换后端。
 
 代码补丁也使用 KittyMemory，临时开放所需页的写权限、写入、恢复权限并刷新指令缓存。Dobby 仍负责安装/解除 Hook 和自己的 trampoline 内部操作；`dobby_patch_code` 保留旧名称以兼容客户端，但不再调用 DobbyCodePatch。
 
@@ -213,7 +228,7 @@ WebUI 恢复驱动和设备节点设置，保存后重启目标。驱动由外�
 
 `memory_search_exact` 新增 `100;200:512` 无序组、`100;200::512` 有序组、`10~20` 范围及混合类型后缀，支持 hex/UTF-8/UTF-16 搜索；高级搜索返回 `sessions` 和兼容的 `searches`。`memory_filter_value` 省略 `value_type` 时按原生结果类型改善，支持变化、大小比较和指定增减值；原普通数值等于/不等于调用保留。`memory_search_results` 支持至 100000 的 offset。请检查 `truncated/stop_reason`，导出的“全部”仅指全部缓存候选。
 
-手动页面和 MCP 使用相同状态。使用 `debug_help` 查看完整参数；断点的 PC/整数寄存器快照和回溯已由 `breakpoint_hits` / `breakpoint_backtrace` 返回，属于采样而非暂停式调试。
+手动页面和 MCP 使用相同状态。使用 `debug_help` 查看完整参数。断点的 PC/整数寄存器快照和回溯已由 `breakpoint_hits` / `breakpoint_backtrace` 返回，属于采样而非暂停式调试。
 
 按模块搜索机器码特征：
 

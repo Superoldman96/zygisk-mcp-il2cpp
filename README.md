@@ -1,6 +1,6 @@
 # Zygisk IL2CPP MCP
 
-把 Android Unity IL2CPP 游戏进程中的运行时查询、方法调用和 Dobby Hook 暴露给 MCP 客户端的 Zygisk 模块。我要Star⭐ QAQ
+把 Android Unity IL2CPP 游戏进程中的运行时查询、方法调用和 Dobby Hook 暴露给 MCP 客户端的 Zygisk 模块。
 
 ## 频道
 TG：@il2cppmcp QQ：276342773
@@ -17,7 +17,7 @@ https://ifdian.net/a/__mcp/plan
 - 游戏内 ImGui 悬浮菜单：Java SurfaceView 显示，使用 `zh_Font.h` 字体、中英双语、原生标题栏折叠/展开与尺寸调整；默认 Classic 紫色主题，可切换 Dark/Light。保留 Toast、Dump、运行状态和内存/ARM64 分析入口。
 - 对象可视化：自动游戏帧连接、类筛选、多类自动跟踪、对象多选、相机选择、射线、2D/角框/3D 轴对齐方框、名称/距离/计数、人形骨骼；遮挡检测已移除。矩阵接口被裁剪时支持 WorldToScreenPoint 降级，Unity 调用仍只在游戏帧回调执行。
 - 渲染/UI/工作台 MCP 工具：对象与规则、独立父/子窗口、控件树、双向绑定、Lua UI 程序、网格/曲线、检查器和导出。手动操作与 AI 配置共享状态，帮助通过 `debug_help` 查询。
-- 原生 AI 逻辑区：7 个 `logic_program_*` MCP 工具，支持变量、条件、循环、动态对象源、字段读取、绘制覆盖和 UI 变量输出，不依赖 Lua。底层不预装游戏规则，AI 通过 MCP 下发程序和业务界面。
+- 原生 AI 逻辑区：7 个 `logic_program_*` MCP 工具，支持自定义函数、有界循环、集合/字符串运算、动态对象源、字段读取、绘制和 UI 输出，以及显式启用的带参托管调用、去重与异步回执，不依赖 Lua。
 - IL2CPP：跨 Image 模糊搜索类/方法/字段，字段偏移与类型、完整方法签名、对象字段、数组/List/Dictionary 加载、带参静态/实例方法调用，以及方法 Hook。
 - IL2CPP Dump：支持全量、指定类或命名空间，写入目标应用私有目录 `files/zygisk_il2cpp_mcp/il2cpp_dump_<随机后缀>.cs`；MCP 只返回状态、路径和类数量，不返回正文。
 - 非 IL2CPP 内存工具：安全读写映射、模块起止地址/重复实例定位、地址反查、多级指针链、并行基址扫描、字节/类型化搜索及多轮过滤。
@@ -29,8 +29,9 @@ https://ifdian.net/a/__mcp/plan
 - 外部暂停调试：Root companion 仅对启动时固定的目标 PID 提供 ARM64 单线程暂停、X0–X30/SP/PC/PSTATE 读取、受校验寄存器写入、单步、帧指针回溯和恢复。它与不暂停进程的 perf 采样断点是两套能力；不提供按地址停止断点、step-over/step-out、FP/SIMD/SVE 或任意 PID 附加，权限只有实际暂停时才能确认，并由 1–15 秒租约和断线清理限制停顿时间。
 - 调试工作流：MCP 与游戏内“调试项目”页共享持久项目、对象/List/Dictionary/内存快照与差异、后台只读任务、变更记录/受校验撤销和统一停止。项目保存符号配置和笔记，不在重启后重放调用或信任旧对象地址；快照不是全进程一致性快照。
 - 持久日志与诊断：Root companion 把会话日志分卷保存在 `/data/adb/zygisk_il2cpp_mcp/journal/`，目标崩溃或重新启动后仍可从 WebUI 分页查看、筛选、导出或明确确认后清理。诊断包只收集有界日志和模块/后端/系统摘要，不自动收集全系统 logcat、tombstone 或完整内存。
-- MCP 功能控制：20 组开关全部默认开启（新增 `rendering`、`overlay_ui`），仅通过默认 `127.0.0.1:27185` 浏览器管理页面动态关闭。管理接口不会暴露给 Agent；禁用工具会从 `tools/list` 消失，原始命令也无法绕过对应开关。
-- 除反编译器外的可选能力按需懒加载；ARM64 Ghidra 反编译器在功能默认开启时随注入主体一同初始化。目标 ABI、内核或运行时不支持时只停用对应工具，Socket、内存、Dobby 和其他能力继续工作。
+- MCP 功能控制：各组开关全部默认开启（包含 `native_libraries`），仅通过默认 `127.0.0.1:27185` 浏览器管理页面动态关闭。管理接口不会暴露给 Agent；禁用工具会从 `tools/list` 消失，原始命令也无法绕过对应开关。
+- ARM64 Ghidra 默认异步预检，SO 装载、初始化和分析在限时工作进程执行，不再加载进 Unity 主进程；失败仅停用反编译。普通 IL2CPP 优先标准 API，其他可选能力按需启用。
+- 自定义 SO：`native_library_inject` 向已连接目标分块上传并显式执行 SO，`native_library_status` 查询结果；校验 ABI/ELF/传输完整性，不需要额外 adb push。自定义代码在目标内运行，可导致崩溃；不提供不安全卸载或任意 PID 附加。
 - JNI Toast：显示当前 MCP tool 与参数，可通过 MCP 开关或主动显示自定义内容。
 - 注入目标启动提示：目标进程初始化时会通过 Toast 显示 `TG: @il2cppmcp`；如果 Android 应用上下文尚未就绪，模块会在启动后短暂重试，不影响目标进程运行。
 - 无第三方 Python 依赖的 stdio MCP Server，默认自动执行 `adb forward`。
@@ -67,16 +68,16 @@ WebUI 的“注入 ImGui 窗口”默认开启；关闭并保存后，下次启�
 - **场景**：表格形式的场景/对象树，箭头展开、名称打开独立检查器；支持分页、重试和缺失场景接口的降级查询。
 - **IL2CPP**：程序集/类列表与可展开方法面板；单击类打开独立类型标签页，双击或“独立类型详情”打开新窗口。支持上下排列/左右分栏、方法调用/固定返回/追踪/断点/分析入口、独立对象选择窗，并自动带入选中实例。字段值、字段类型路径导航、类/命名空间 Dump 与关系流程图保留。
 - **工具**：模块、程序集、Hook、断点列表；运行状态与 Dump 放在折叠区域。内存/汇编/伪代码在单独的分析窗口。
-- **分析窗口**：按类型/映射自动决定读取长度；每页数量可设 1–256（默认 32），内存每行 16 字节。伪代码通过 Ghidra 地址映射双向同步汇编，可从指令启动计数、追踪和断点。未知函数范围仍有 16 KiB 上限与估算提示。
+- **分析窗口**：按类型/映射自动决定读取长度；本地每页数量可设 1–100,000（默认 32），远程接口保留各自批量上限；内存每行 16 字节。伪代码通过 Ghidra 地址映射双向同步汇编，可从指令启动计数、追踪和断点。未知函数范围仍有 16 KiB 上限与估算提示。
 - **渲染**：对象、类跟踪、相机、样式和规则各自分页。对象和类支持搜索、多选、表格编辑与检查器跳转，不依赖 AI 才能操作。
 - **扩展控件**：只有 AI/MCP 创建了面板才出现，用于操作已有控件。隐藏面板、窗口树和 Lua UI 程序的手动创建编辑器；对应 MCP 工具及 AI 创建的窗口保持可用。
 - **AI 逻辑**：通用 JSON 程序编辑、校验、保存、启停、重启和删除；查看对象源、运行成本及错误，不内置特定游戏的控制面板。
 - **MCP 调用日志**：时间、来源、状态、命令、耗时列表与独立详情区；默认只看远程请求，可筛选、暂停、复制和导出。关闭 Toast 不会关闭日志。
 - **设置**：中文/英文、Classic 紫色/Dark/Light、缩放、透明度、每页数量、三类屏幕日志开关和 MCP Toast；修改后自动保存加载，窗口/表格布局也自动保存。可选预设和书签放在设置的独立分页。
 
-本轮详情和兼容边界。内存页新增冻结任务、搜索和基址链管理；调试页分别管理追踪与断点。屏幕日志 8 秒后渐隐，显示控制独立于 Toast。
+内存页新增冻结任务、搜索和基址链管理；调试页分别管理追踪与断点。屏幕日志 8 秒后渐隐，显示控制独立于 Toast。
 
-最新修复：局部 Dump/对象 JSON/Ghidra 异常处理、UI 可调扫描预算、独立全屏关系图、方法调试快捷入口，以及 Root companion 外部硬件采样。安装时随机化 SO 实际文件名，保留 ABI 入口链接；新增改名 IL2CPP 库识别。随机名称不代表注入不可检测，硬件断点仍取决于内核支持。
+局部 Dump/对象 JSON/Ghidra 异常处理、UI 可调扫描预算、独立全屏关系图、方法调试快捷入口，以及 Root companion 外部硬件采样。安装时随机化 SO 实际文件名，保留 ABI 入口链接；新增改名 IL2CPP 库识别。随机名称不代表注入不可检测，硬件断点仍取决于内核支持。
 
 设置保存于目标应用 `files/zygisk_il2cpp_mcp/settings/ui.json`，后台合并写入，不在绘制线程访问文件。界面偏好、Toast 和布局自动恢复；保存为 `default` 的工作区预设也会尝试加载。原生逻辑程序只有在预设中设置 `auto_start=true` 才自动启动，对象源重新解析；旧对象句柄、游戏写入和方法调用不会恢复，Lua UI 程序保持停止。
 
@@ -84,10 +85,11 @@ WebUI 的“注入 ImGui 窗口”默认开启；关闭并保存后，下次启�
 
 Java 菜单启动后自动探测已加载 IL2CPP 中合适的 MonoBehaviour `Update/LateUpdate/FixedUpdate`，不再要求用户先填写帧绑定表单。探测有数量上限，需要可用的帧计数接口；最多安装 16 个透传 Dobby 探针，观察到真实回调后才启用游戏帧查询。探测失败显示原因，类型浏览与普通内存工具仍可使用；`render_binding_status` 可查看已安装探针，`render_unbind_update` 会移除它们并停止本进程自动探测，仍保留 MCP 手动绑定作为高级入口。
 
-显示层使用 Java 上下文，不 Hook 游戏 EGL；窗口、详情窗和下拉弹窗之外的触摸交还游戏。Activity 暂停/销毁后释放 Surface，恢复时重新挂载。DEX、JNI 或 GLES3 失败只停用显示层，无界面子进程不显示。字体嵌入根目录 `zh_Font.h`。
+显示层使用 Java 管理的独立透明 SurfaceView 和 EGL/GLES3 上下文，不 Hook 游戏 EGL；窗口、详情窗和下拉弹窗之外的触摸交还游戏。Activity 暂停/销毁后释放 Surface，恢复时重新挂载。DEX、JNI 或 GLES3 失败只停用显示层，无界面子进程不显示。字体嵌入根目录 `zh_Font.h`。
 
-矩阵缺失时尝试 WorldToScreenPoint，相机枚举缺失时尝试 FindObjectsOfType(Camera)。缺失能力只影响相应功能。屏幕图元无需 IL2CPP，非 IL2CPP 世界坐标绘制可提供相机矩阵。父窗口、Lua UI、导出和预设见。
+矩阵缺失时尝试 WorldToScreenPoint，相机枚举缺失时尝试 FindObjectsOfType(Camera)。缺失能力只影响相应功能。屏幕图元无需 IL2CPP，非 IL2CPP 世界坐标绘制可提供相机矩阵。
 
+菜单 Java 源码位于 `module/src/overlay/java`。正常 Gradle 构建会自动执行 `generateOverlayDex`，使用当前 Gradle JVM、Android Gradle 插件配套的 D8 和 Android SDK 类库生成并嵌入 DEX，不需要独立 APK 或额外 JDK；不再直接调用 SDK Build Tools 内可能过旧的 D8。Android 8+ 从内存加载，Android 6/7 使用目标应用私有 `code_cache`。
 
 ## MCP 启动
 
@@ -103,7 +105,7 @@ http://127.0.0.1:27185/
 
 开关保存到 `mcp/mcp_features.json`。使用 `--admin-port` 修改端口，使用 `--no-admin` 关闭页面；管理端口监听非本机地址时必须同时配置 `--admin-token`。
 
-用户正常构建模块时，`generateMcpArchive` 会从 `mcp/` 源码生成客户端 ZIP，包含渲染/工作台/调试/逻辑以及关系链、暂停调试、任务和工作流工具模块及相关接口文档。WebUI 一键导出的 `MCP.zip` 不再依赖模板中的旧静态压缩包；使用新工具需同时更新设备模块和客户端文件。
+正常构建模块时，`generateMcpArchive` 会从 `mcp/` 源码生成客户端 ZIP，包含渲染/工作台/调试/逻辑以及关系链、暂停调试、任务和工作流工具模块及相关接口文档。WebUI 一键导出的 `MCP.zip` 不再依赖模板中的旧静态压缩包；使用新工具需同时更新设备模块和客户端文件。
 
 如果 MCP Server 就运行在目标 Android 设备上，使用直连模式，不需要 ADB 端口转发：
 
@@ -128,7 +130,7 @@ python mcp/mcp_server.py --port 27184 --direct
 
 完整工具说明见 [mcp/README.md](mcp/README.md)。
 
-ARM64 伪代码能力集成 Apache-2.0 许可的 [ghidra-native](https://github.com/radareorg/ghidra-native)，使用 Ghidra Decompiler 与 Sleigh 语义恢复 C 风格代码，无需 Java、RetDec 或外部反编译服务。反编译器使用独立 `libghidra_decompiler.so`：功能默认开启并随注入主体加载，通过受限回调读取目标当前的代码、只读数据、字符串与全局变量。对 `libil2cpp.so` 中的精确方法起始地址，模块会反查运行时元数据并锁定 Ghidra 函数原型和类字段布局；未匹配或 IL2CPP API 不可用时自动退回普通 Native 反编译。缺失、ABI 不兼容或初始化失败只会停用反编译，不影响 Hook、内存、Lua、Dobby 与断点功能。
+ARM64 伪代码能力使用 Apache-2.0 许可的 [ghidra-native](https://github.com/radareorg/ghidra-native)，由 Ghidra Decompiler 与 Sleigh 恢复 C 风格代码，无需 Java 或 RetDec。反编译库的装载、初始化和分析在独立工作进程完成；默认使用代码快照与已缓存的 IL2CPP 类型信息，可显式请求已知方法的类型增强。工作进程崩溃、超时或不兼容会返回具体原因并停用本会话的反编译能力，不保证隔离目标自身故障或自定义 SO 副作用。
 
 ## 风险提示
 

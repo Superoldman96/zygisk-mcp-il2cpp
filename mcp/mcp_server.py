@@ -22,14 +22,14 @@ from urllib.parse import urlparse
 
 if __package__:
     from . import (render_tools, workspace_tools, debug_tools, logic_tools,
-                   relationship_tools, paused_debug_tools, task_tools, workflow_tools)
+                   relationship_tools, paused_debug_tools, task_tools, workflow_tools, native_library_tools)
 else:
     import render_tools, workspace_tools, debug_tools, logic_tools
-    import relationship_tools, paused_debug_tools, task_tools, workflow_tools
+    import relationship_tools, paused_debug_tools, task_tools, workflow_tools, native_library_tools
 
 
 SERVER_NAME = "zygisk-il2cpp-mcp"
-SERVER_VERSION = "2.5.0"
+SERVER_VERSION = "2.6.1"
 LATEST_PROTOCOL = "2025-11-25"
 SUPPORTED_PROTOCOLS = {
     "2024-11-05",
@@ -60,6 +60,7 @@ FEATURES: dict[str, str] = {
     "lua": "Embedded LuaJIT execution",
     "assembly": "Assembly, disassembly, and instruction patching",
     "decompiler": "Ghidra-native ARM64 C pseudocode decompilation",
+    "native_libraries": "Explicit custom SO upload/loading in the connected target",
     "breakpoint": "Hardware breakpoints, watchpoints, hits, and backtraces",
     "diagnostics": "Runtime capabilities, help, and raw bridge commands",
 }
@@ -224,7 +225,8 @@ class HookSocketClient:
         command = _single_line(command, "command").strip()
         if not command:
             raise BridgeError("command cannot be empty")
-        command_limit = 8*1024*1024+64 if command.startswith("WORKSPACE_BROWSER ") else 64*1024
+        command_limit = (8*1024*1024+64 if command.startswith("WORKSPACE_BROWSER ") else
+                         160*1024 if command.startswith("NATIVE_LIBRARY_CONTROL ") else 64*1024)
         if len(command.encode("utf-8")) > command_limit:
             raise BridgeError("command is too long")
 
@@ -513,7 +515,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_status",
             "title": "Get IL2CPP runtime status",
-            "description": "Initialize/attach to IL2CPP and return its base and domain addresses.",
+            "description": "Probe IL2CPP without requiring thread attach. ready means basic exports only, not every feature. metadata_query_supported indicates an enumeration backend; metadata_query_ready indicates native enumeration or at least one verified legacy image. compatibility reports lazy managed-reflection cache verification, array/object layout validation, and precise errors. Status itself never invokes reflection or allocates target objects. Includes the separate stripped-runtime TypeDatabase diagnostics.",
             "inputSchema": EMPTY_SCHEMA,
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
         },
@@ -527,7 +529,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_list_images",
             "title": "List IL2CPP images",
-            "description": "List loaded IL2CPP assembly image names.",
+            "description": "List IL2CPP assembly image names. Uses the validated metadata TypeDatabase when runtime exports are stripped.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 256}},
@@ -536,9 +538,29 @@ TOOLS.extend(
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
         },
         {
+            "name": "il2cpp_unity_catalog",
+            "title": "List Unity compatibility metadata",
+            "description": "List Unity scene, component, renderer, or asset type declarations from the validated TypeDatabase. Works when il2cpp_* exports are stripped. Results are metadata declarations, never fabricated live instances; protected names include stable aliases plus raw metadata names.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "enum": ["all", "scene", "component", "asset", "renderer"],
+                        "default": "all",
+                    },
+                    "query": {"type": "string", "default": ""},
+                    "offset": {"type": "integer", "minimum": 0, "maximum": 1000000, "default": 0},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+                },
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        },
+        {
             "name": "il2cpp_list_classes",
             "title": "List IL2CPP classes",
-            "description": "List or filter classes in an IL2CPP image.",
+            "description": "List or filter classes in an IL2CPP image. Prefers native exports. Older runtimes lacking image enumeration use validated core-library reflection over already loaded assemblies (cached per image); errors are explicit, never silently empty. Fully stripped runtimes use the separate validated metadata TypeDatabase.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -555,7 +577,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_list_methods",
             "title": "List IL2CPP methods",
-            "description": "List methods, native addresses, RVAs, parameter types, and return types for a class.",
+            "description": "List methods, validated native addresses/RVAs, parameter types, and return types for a class. On stripped runtimes, unavailable registration data is represented safely instead of invoking guessed APIs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -573,7 +595,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_find_method",
             "title": "Resolve IL2CPP method",
-            "description": "Resolve an IL2CPP method to metadata, native address, and RVA.",
+            "description": "Resolve an IL2CPP method to metadata and, when validated registration data is available, its native address and RVA. Supports the read-only stripped-runtime TypeDatabase.",
             "inputSchema": {
                 "type": "object",
                 "properties": METHOD_LOOKUP_PROPERTIES,
@@ -621,7 +643,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_hook",
             "title": "Hook IL2CPP method",
-            "description": "Resolve an IL2CPP method and install a Dobby hook to an explicit native replacement address; returns the original trampoline address.",
+            "description": "Resolve an IL2CPP method and install a Dobby hook to an explicit native replacement address; returns the original trampoline address. Stripped runtimes are supported only after CodeRegistration and the method address pass structural/executable validation.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -636,7 +658,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_hook_return",
             "title": "Hook IL2CPP method return",
-            "description": "Resolve an IL2CPP method and install a Dobby replacement that returns a fixed ABI value, skipping the entire method body for all instances. Calling again updates our existing same-ABI fixed return without rehooking. Other hook/trace owners are not overwritten; a different ABI requires explicit removal first.",
+            "description": "Resolve an IL2CPP method and install a Dobby replacement that returns a fixed ABI value, skipping the entire method body for all instances. Stripped runtimes require a structurally validated CodeRegistration/method address. Calling again updates our existing same-ABI fixed return without rehooking; other hook/trace owners are not overwritten.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -934,7 +956,7 @@ TOOLS.extend(
         {
             "name": "dobby_resolve_symbol",
             "title": "Resolve native symbol",
-            "description": "Resolve a native symbol using DobbySymbolResolver.",
+            "description": "Resolve an exported symbol in already loaded modules, without loading libraries or parsing static ELF section tables. image is an exact basename or full loaded path; use full paths for duplicate basenames. Missing exports return address 0x0. Ambiguous global matches return an error. The legacy tool name is retained; this no longer invokes Dobby's unbounded internal-symbol fallback.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"image": {"type": "string", "default": ""}, "symbol": {"type": "string"}},
@@ -1093,11 +1115,11 @@ TOOLS.extend(
         },
         {
             "name": "assembly_assemble",
-            "title": "Assemble ARM64 instruction",
-            "description": "Assemble one AArch64 textual instruction into machine-code bytes without changing memory.",
+            "title": "Validate and assemble ARM64 code",
+            "description": "Validate one or multiple newline-separated AArch64 instructions and return machine-code bytes without changing memory. Each non-empty line must encode exactly one instruction.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"instruction": {"type": "string", "maxLength": 1024}},
+                "properties": {"instruction": {"type": "string", "maxLength": 16384}},
                 "required": ["instruction"],
                 "additionalProperties": False,
             },
@@ -1122,10 +1144,10 @@ TOOLS.extend(
         {
             "name": "assembly_patch",
             "title": "Assemble and patch ARM64 code",
-            "description": "Assemble one AArch64 instruction and patch an executable address with KittyMemory, restoring page permissions and flushing the instruction cache.",
+            "description": "Validate one or multiple newline-separated AArch64 instructions, then patch them contiguously downward from the executable address with KittyMemory. Validation failure writes nothing.",
             "inputSchema": {
                 "type": "object",
-                "properties": {"address": {"type": "string"}, "instruction": {"type": "string", "maxLength": 1024}},
+                "properties": {"address": {"type": "string"}, "instruction": {"type": "string", "maxLength": 16384}},
                 "required": ["address", "instruction"],
                 "additionalProperties": False,
             },
@@ -1134,14 +1156,14 @@ TOOLS.extend(
         {
             "name": "decompiler_status",
             "title": "Get pseudocode engine status",
-            "description": "Report whether the isolated Ghidra-native ARM64 decompiler is loaded in the target process.",
+            "description": "Report nonblocking Ghidra worker readiness, busy state and exact initialization errors. Loading and analysis are isolated in a bounded child; loaded does not mean loaded in the Unity process.",
             "inputSchema": EMPTY_SCHEMA,
             "annotations": {"readOnlyHint": True, "openWorldHint": False},
         },
         {
             "name": "decompile_function",
             "title": "Decompile ARM64 function",
-            "description": "Decompile a bounded ARM64 function with Ghidra/Sleigh using live target memory for referenced strings and globals. Exact IL2CPP method addresses automatically receive managed return, parameter, class, and field-offset types.",
+            "description": "Decompile a bounded readable/executable ARM64 function using a code snapshot and bounded referenced-data snapshots. Default metadata_mode=cached invokes no target IL2CPP APIs: reuses previously queried method names/proven primitive signatures, otherwise native inference. resolve_known explicitly enriches ONLY previously queried exact methods with class/field types using target runtime APIs; opt in only on compatible runtimes. Never scans all IL2CPP classes implicitly. Returns many-to-many source_map for synchronized code navigation. Native engine remains in-process; not a crash-isolated worker.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1151,6 +1173,7 @@ TOOLS.extend(
                     "max_output_bytes": {"type": "integer", "minimum": 256, "maximum": 1048576, "default": 262144},
                     "optimize": {"type": "boolean", "default": True},
                     "stop_at_return": {"type": "boolean", "default": True, "description": "Stop at the first linear RET when an exact function size is unavailable."},
+                    "metadata_mode": {"type": "string", "enum": ["cached", "resolve_known"], "default": "cached"},
                 },
                 "required": ["address"],
                 "additionalProperties": False,
@@ -1256,7 +1279,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_search",
             "title": "Fuzzy-search IL2CPP metadata",
-            "description": "Search classes, methods, or fields across one or every loaded IL2CPP image with filters and pagination.",
+            "description": "Search classes, methods, or fields across one or every IL2CPP image with filters and pagination, including validated stripped-runtime metadata fallback.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1278,7 +1301,7 @@ TOOLS.extend(
         {
             "name": "il2cpp_list_fields",
             "title": "List IL2CPP fields",
-            "description": "List field types, offsets, flags, and static/literal state for an exact IL2CPP class.",
+            "description": "List field types, offsets, flags, and static/literal state for an exact IL2CPP class. Stripped-runtime fallback returns validated reachable fields and reports when inherited traversal is unavailable.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1479,10 +1502,13 @@ TOOLS.extend(relationship_tools.TOOLS)
 TOOLS.extend(paused_debug_tools.TOOLS)
 TOOLS.extend(task_tools.TOOLS)
 TOOLS.extend(workflow_tools.TOOLS)
+TOOLS.extend(native_library_tools.TOOLS)
 TOOL_BY_NAME = {tool["name"].lower(): tool for tool in TOOLS}
 
 
 def tool_features(name: str) -> tuple[str, ...]:
+    if name in native_library_tools.BY_NAME:
+        return ("native_libraries",)
     if name in workflow_tools.BY_NAME:
         return workflow_tools.features(name)
     if name in task_tools.BY_NAME:
@@ -1549,6 +1575,8 @@ def tool_features(name: str) -> tuple[str, ...]:
 def raw_command_features(native_name: str) -> tuple[str, ...]:
     """Conservative feature classification for the raw native escape hatch."""
     native_name = native_name.upper()
+    if native_name == "NATIVE_LIBRARY_CONTROL":
+        return ("native_libraries",)
     # Exact extension protocols must run before workspace_tools' generic
     # WORKSPACE_* fallback.
     exact = (logic_tools.native_features(native_name) or debug_tools.native_features(native_name) or
@@ -1764,6 +1792,7 @@ class ToolDispatcher:
             "il2cpp_status": self.il2cpp_status,
             "il2cpp_dump_file": self.il2cpp_dump_file,
             "il2cpp_list_images": self.il2cpp_list_images,
+            "il2cpp_unity_catalog": self.il2cpp_unity_catalog,
             "il2cpp_list_classes": self.il2cpp_list_classes,
             "il2cpp_list_methods": self.il2cpp_list_methods,
             "il2cpp_list_fields": self.il2cpp_list_fields,
@@ -1845,6 +1874,8 @@ class ToolDispatcher:
             method = lambda args: self._task_call(name, args)
         if name in workflow_tools.BY_NAME:
             method = lambda args: self._workflow_call(name, args)
+        if name in native_library_tools.BY_NAME:
+            method = lambda args: self._native_library_call(name, args)
         if method is None:
             raise BridgeError(f"unknown tool: {name}")
         if not isinstance(arguments, dict):
@@ -1863,6 +1894,12 @@ class ToolDispatcher:
                 del self._call_context.config
             else:
                 self._call_context.config = previous
+
+    def _native_library_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            return native_library_tools.execute(name, arguments, self._json_call)
+        except (ValueError, OSError) as exc:
+            raise BridgeError(str(exc)) from exc
 
     def _logic_call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -2088,6 +2125,9 @@ class ToolDispatcher:
         if native_name == "MCP_QUERY_V1":
             raise BridgeError("MCP_QUERY_V1 is an internal envelope; call the IL2CPP metadata tool or its original native command")
         raw_features = raw_command_features(native_name)
+        # Opt-in metadata enrichment must not bypass its feature gate via raw calls.
+        if native_name == "DECOMP_DECOMPILE" and command.split()[-1] == "resolve_known":
+            raw_features += ("il2cpp_metadata",)
         disabled = [feature for feature in raw_features if not self.registry.enabled(feature)]
         if disabled:
             raise BridgeError(
@@ -2238,7 +2278,9 @@ class ToolDispatcher:
         return "s" + str(value).encode("utf-8").hex()
 
     def il2cpp_status(self, _: dict[str, Any]) -> dict[str, Any]:
-        return self._json_call("IL2CPP_STATUS")
+        # First probe on a stripped runtime may build a bounded read-only
+        # metadata database and scan the identified module's data mappings.
+        return self._json_call("IL2CPP_STATUS", timeout=max(self.config.timeout, 30.0))
 
     def il2cpp_dump_file(self, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -2253,6 +2295,18 @@ class ToolDispatcher:
         if not 1 <= limit <= 5000:
             raise BridgeError("limit must be between 1 and 5000")
         return self._json_call(f"IL2CPP_IMAGES {limit}")
+
+    def il2cpp_unity_catalog(self, args: dict[str, Any]) -> dict[str, Any]:
+        category = str(args.get("category", "all"))
+        if category not in {"all", "scene", "component", "asset", "renderer"}:
+            raise BridgeError("category must be all, scene, component, asset, or renderer")
+        query = self._hex_text(_single_line(args.get("query", ""), "query"))
+        offset = self._bounded_integer(args.get("offset", 0), "offset", 0, 1000000)
+        limit = self._bounded_integer(args.get("limit", 100), "limit", 1, 1000)
+        return self._json_call(
+            f"IL2CPP_UNITY_CATALOG {category} {query} {offset} {limit}",
+            timeout=max(self.config.timeout, 60.0),
+        )
 
     def il2cpp_list_classes(self, args: dict[str, Any]) -> dict[str, Any]:
         image = self._hex_text(self._required_text(args, "image"))
@@ -3082,9 +3136,12 @@ class ToolDispatcher:
         return self._json_call("ASM_STATUS")
 
     def assembly_assemble(self, args: dict[str, Any]) -> dict[str, Any]:
-        instruction = self._required_text(args, "instruction").strip()
-        if not instruction or len(instruction.encode("utf-8")) > 1024:
-            raise BridgeError("instruction must contain 1 to 1024 UTF-8 bytes")
+        instruction = args.get("instruction")
+        if not isinstance(instruction, str) or "\x00" in instruction:
+            raise BridgeError("instruction must be text without NUL bytes")
+        instruction = instruction.strip()
+        if not instruction or len(instruction.encode("utf-8")) > 16384:
+            raise BridgeError("instruction must contain 1 to 16384 UTF-8 bytes")
         return self._json_call(f"ASM_ASSEMBLE {self._hex_text(instruction)}")
 
     def assembly_disassemble(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -3097,9 +3154,12 @@ class ToolDispatcher:
 
     def assembly_patch(self, args: dict[str, Any]) -> dict[str, Any]:
         address = self._address(self._required_text(args, "address"), "address")
-        instruction = self._required_text(args, "instruction").strip()
-        if not instruction or len(instruction.encode("utf-8")) > 1024:
-            raise BridgeError("instruction must contain 1 to 1024 UTF-8 bytes")
+        instruction = args.get("instruction")
+        if not isinstance(instruction, str) or "\x00" in instruction:
+            raise BridgeError("instruction must be text without NUL bytes")
+        instruction = instruction.strip()
+        if not instruction or len(instruction.encode("utf-8")) > 16384:
+            raise BridgeError("instruction must contain 1 to 16384 UTF-8 bytes")
         return self._json_call(f"ASM_PATCH {address} {self._hex_text(instruction)}")
 
     def decompiler_status(self, _: dict[str, Any]) -> dict[str, Any]:
@@ -3120,9 +3180,14 @@ class ToolDispatcher:
         stop_at_return = args.get("stop_at_return", True)
         if not isinstance(optimize, bool) or not isinstance(stop_at_return, bool):
             raise BridgeError("optimize and stop_at_return must be booleans")
+        metadata_mode = args.get("metadata_mode", "cached")
+        if metadata_mode not in {"cached", "resolve_known"}:
+            raise BridgeError("metadata_mode must be cached or resolve_known")
+        if metadata_mode == "resolve_known":
+            self.registry.require("il2cpp_find_method")
         return self._json_call(
             f"DECOMP_DECOMPILE {address} {size} {maximum} {max_output} "
-            f"{1 if optimize else 0} {1 if stop_at_return else 0}",
+            f"{1 if optimize else 0} {1 if stop_at_return else 0}" + (" resolve_known" if metadata_mode == "resolve_known" else ""),
             timeout=max(self.config.timeout, 60.0),
         )
 

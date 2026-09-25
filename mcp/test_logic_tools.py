@@ -95,6 +95,20 @@ class NativeLogicToolsTests(unittest.TestCase):
         for name, tool in lt.BY_NAME.items():
             self.assertEqual(tool["annotations"]["readOnlyHint"], name in readonly)
 
+    def test_functions_and_explicit_calls_roundtrip(self):
+        descriptor = {"id": "flow", "allow_calls": True, "functions": {
+            "twice": {"params": ["n"], "steps": [{"op": "return", "value": {"op": "mul", "args": [{"var": "n"}, 2]}}]}},
+            "steps": [{"op": "emit", "kind": "call", "target": "once", "value": {
+                "image": "Example.dll", "class": "Counter", "token": 100663297, "arguments": [3]}}]}
+        wire = lt.encode("logic_program_set", {"descriptor": descriptor})
+        self.assertEqual(json.loads(bytes.fromhex(wire.split()[1])), descriptor)
+        self.assertIn("il2cpp_invoke", lt.features("logic_program_set"))
+        self.dispatcher.registry.set("il2cpp_invoke", False)
+        with patch.object(self.dispatcher, "_json_call") as native:
+            with self.assertRaises(BridgeError):
+                self.dispatcher.call("logic_program_set", {"descriptor": descriptor})
+            native.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,7 +13,8 @@ import tomllib
 
 EXPECTED={"unity_resource_monitor","unity_resource_preview","unity_resource_export",
           "il2cpp_generic_resolve","il2cpp_parameter_schema","frida_control",
-          "memory_chain_export","workspace_browser","workspace_caller"}
+          "memory_chain_export","workspace_browser","workspace_caller",
+          "native_library_inject","native_library_status","il2cpp_relation_find"}
 
 def verify(config_path: Path):
     server=Path(__file__).with_name("mcp_server.py").resolve()
@@ -27,7 +28,7 @@ def verify(config_path: Path):
     if installed.get("enabled") is False:raise RuntimeError("registered MCP server is disabled")
     requests=[{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"local-source-verifier","version":"1"}}},
               {"jsonrpc":"2.0","id":2,"method":"tools/list"},
-              {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"debug_help","arguments":{"command":"frida_control"}}}]
+              {"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"debug_help","arguments":{"command":"native_library_inject"}}}]
     # Isolate feature configuration; do not enable/disable the user's switches.
     with tempfile.TemporaryDirectory(prefix="zygisk-mcp-verify-") as folder:
         command=[str(interpreter),str(server),"--no-admin","--no-adb-forward","--feature-config",str(Path(folder)/"features.json")]
