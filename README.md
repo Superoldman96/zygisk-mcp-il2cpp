@@ -5,8 +5,9 @@
 ## 频道
 TG：@il2cppmcp QQ：276342773
 
-## 发电
+## 发电 && 推广
 https://ifdian.net/a/__mcp/plan
+推荐AI中转站(up同款并非本人业务)https://www.codextopapi.com/
 
 ## 已实现
 
