@@ -29,14 +29,20 @@ class OneShotHookServer:
         self.thread = threading.Thread(target=self._serve, daemon=True)
 
     def _serve(self) -> None:
-        connection, _ = self.socket.accept()
-        with connection:
-            data = bytearray()
-            while not data.endswith(b"\n"):
-                data.extend(connection.recv(1024))
-            self.command = data.decode("utf-8").rstrip("\r\n")
-            body = self.response.encode("utf-8")
-            connection.sendall(f"OK {len(body)}\n".encode("ascii") + body)
+        while True:
+            connection, _ = self.socket.accept()
+            with connection:
+                data = bytearray()
+                while not data.endswith(b"\n"):
+                    data.extend(connection.recv(1024))
+                command = data.decode("utf-8").rstrip("\r\n")
+                if command.startswith("MCP_ROUTE "):
+                    connection.sendall(b"ERR UNKNOWN_COMMAND\n")
+                    continue  # Real pre-2.6.2 modules reject unknown envelopes.
+                self.command = command
+                body = self.response.encode("utf-8")
+                connection.sendall(f"OK {len(body)}\n".encode("ascii") + body)
+                break
         self.socket.close()
 
     def __enter__(self) -> "OneShotHookServer":

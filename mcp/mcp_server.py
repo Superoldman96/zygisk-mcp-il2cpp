@@ -29,7 +29,7 @@ else:
 
 
 SERVER_NAME = "zygisk-il2cpp-mcp"
-SERVER_VERSION = "2.6.1"
+SERVER_VERSION = "2.6.2"
 LATEST_PROTOCOL = "2025-11-25"
 SUPPORTED_PROTOCOLS = {
     "2024-11-05",
@@ -180,6 +180,8 @@ class ConnectionConfig:
     auto_adb_forward: bool = True
     adb_path: str = "adb"
     adb_serial: str | None = None
+    target_session: str | None = None
+    target_process: dict[str, Any] | None = None
 
     def validate(self) -> None:
         if not self.host:
@@ -193,8 +195,11 @@ class ConnectionConfig:
 class HookSocketClient:
     """Client for the native `OK <length>\n<body>` command protocol."""
 
-    def __init__(self, config: ConnectionConfig):
+    def __init__(self, config: ConnectionConfig, *, route_process: bool = False,
+                 on_target: Callable[[dict[str, Any]], None] | None = None):
         self.config = config
+        self.route_process = route_process
+        self.on_target = on_target
 
     @staticmethod
     def _recv_line(sock: socket.socket) -> str:
@@ -221,7 +226,7 @@ class HookSocketClient:
         return bytes(data)
 
     def call(self, command: str, *, timeout: float | None = None, retry_forward: bool = True,
-             _query_diagnostics: bool = True) -> str:
+             _query_diagnostics: bool = True, _process_routing: bool = True) -> str:
         command = _single_line(command, "command").strip()
         if not command:
             raise BridgeError("command cannot be empty")
@@ -232,6 +237,12 @@ class HookSocketClient:
 
         diagnostic = _query_diagnostics and command.split()[0] in {"IL2CPP_FIND_METHOD", "IL2CPP_METHODS"}
         wire_command = f"MCP_QUERY_V1 {command}" if diagnostic else command
+        routed = _process_routing and (self.route_process or self.config.target_session is not None) and command != "MCP_TARGETS"
+        if routed:
+            session = self.config.target_session or "auto"
+            if not isinstance(session, str) or not session or len(session) > 160 or any(c not in "0123456789abcdef-" for c in session) and session != "auto":
+                raise BridgeError("invalid target process session")
+            wire_command = f"MCP_ROUTE {session} {wire_command}"
         last_stage: dict[str, Any] | None = None
         connected = False
         try:
@@ -244,6 +255,30 @@ class HookSocketClient:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.sendall(wire_command.encode("utf-8") + b"\n")
                 header = self._recv_line(sock)
+                if routed and header.startswith("MCP_TARGET_INFO "):
+                    try:
+                        target = json.loads(header[len("MCP_TARGET_INFO "):])
+                    except (ValueError, TypeError) as exc:
+                        raise BridgeError("invalid target process identity") from exc
+                    if (not isinstance(target, dict) or type(target.get("pid")) is not int or target["pid"] <= 1
+                            or not isinstance(target.get("process_name"), str) or not target["process_name"]
+                            or not isinstance(target.get("session"), str) or not target["session"]
+                            or len(target["session"]) > 160
+                            or any(c not in "0123456789abcdef-" for c in target["session"])):
+                        raise BridgeError("invalid target process identity")
+                    if self.config.target_session and target["session"] != self.config.target_session:
+                        raise BridgeError("target process identity changed; command was not replayed")
+                    if self.on_target:
+                        self.on_target(target)
+                    header = self._recv_line(sock)
+                elif routed and header == "ERR UNKNOWN_COMMAND" and self.config.target_session is None:
+                    # Old module rejected the outer routing verb, so the inner
+                    # command (including mutations) was NOT executed. No other
+                    # error/disconnect can trigger this compatibility fallback.
+                    return self.call(command, timeout=timeout, retry_forward=False,
+                                     _query_diagnostics=_query_diagnostics, _process_routing=False)
+                elif routed and not header.startswith("ERR "):
+                    raise BridgeError("process router omitted target identity; command was not replayed")
                 stage_count = 0
                 while diagnostic and header.startswith("MCP_STAGE "):
                     stage_count += 1
@@ -260,7 +295,8 @@ class HookSocketClient:
                 if header.startswith("ERR "):
                     if diagnostic and last_stage is None and header == "ERR UNKNOWN_COMMAND":
                         # Old module rejected the envelope, so the read-only query was not run.
-                        return self.call(command, timeout=timeout, retry_forward=False, _query_diagnostics=False)
+                        return self.call(command, timeout=timeout, retry_forward=False, _query_diagnostics=False,
+                                         _process_routing=_process_routing)
                     raise BridgeError(header[4:].strip() or "hook call failed")
                 if not header.startswith("OK "):
                     raise BridgeError(f"unexpected hook response: {header!r}")
@@ -278,7 +314,8 @@ class HookSocketClient:
         except OSError as exc:
             if not connected and retry_forward and self._can_auto_forward():
                 self._adb_forward()
-                return self.call(command, timeout=timeout, retry_forward=False, _query_diagnostics=_query_diagnostics)
+                return self.call(command, timeout=timeout, retry_forward=False, _query_diagnostics=_query_diagnostics,
+                                 _process_routing=_process_routing)
             if connected:
                 raise BridgeError(
                     f"{command.split()[0]} transport failed after connecting to "
@@ -319,6 +356,33 @@ class HookSocketClient:
 EMPTY_SCHEMA = {"type": "object", "additionalProperties": False}
 
 TOOLS: list[dict[str, Any]] = [
+    {
+        "name": "process_list",
+        "title": "List injected processes",
+        "description": "List live injected main/subprocesses at this gateway with PID, process_name and session. Does not select or change a target. Requires module 2.6.2+; only configured and successfully registered processes appear.",
+        "inputSchema": EMPTY_SCHEMA,
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
+    {
+        "name": "process_select",
+        "title": "Select injected process",
+        "description": "Select by exact process_name and/or PID from process_list. Pins this MCP service to that process lifetime for ALL subsequent tools. Multiple matches are rejected; exit/restart requires explicit reselection and discarding old addresses/handles. Switching does not stop hooks/freezes in the previous process.",
+        "inputSchema": {
+            "type": "object", "properties": {
+                "pid": {"type": "integer", "minimum": 2, "maximum": 2147483647},
+                "process_name": {"type": "string", "minLength": 1, "maxLength": 1024},
+            }, "anyOf": [{"required": ["pid"]}, {"required": ["process_name"]}],
+            "additionalProperties": False,
+        },
+        "annotations": {"openWorldHint": False},
+    },
+    {
+        "name": "process_current",
+        "title": "Verify current process",
+        "description": "Return the live PID, UID, exact process_name and session of the current target. A sole target is automatically pinned; multiple targets require process_select. Does not silently follow a restarted process.",
+        "inputSchema": EMPTY_SCHEMA,
+        "annotations": {"readOnlyHint": True, "openWorldHint": False},
+    },
     {
         "name": "ping",
         "title": "Check hook connection",
@@ -1525,7 +1589,7 @@ def tool_features(name: str) -> tuple[str, ...]:
         return workspace_tools.features(name)
     if name in render_tools.BY_NAME:
         return render_tools.features(name)
-    if name in {"ping", "connection_info", "configure_connection"}:
+    if name in {"ping", "connection_info", "configure_connection", "process_list", "process_select", "process_current"}:
         return ("connection",)
     if name.startswith("mcp_toast_") or name in {
         "get_clipboard", "show_input_box", "wait_input", "input_and_wait", "push_input_result"
@@ -1763,7 +1827,20 @@ class ToolDispatcher:
         self._input_lock = threading.RLock()
 
     def _client(self) -> HookSocketClient:
-        return HookSocketClient(getattr(self._call_context, "config", self.config))
+        config = getattr(self._call_context, "config", self.config)
+        return HookSocketClient(config, route_process=True,
+                                on_target=lambda target: self._remember_target(config, target))
+
+    def _remember_target(self, config: ConnectionConfig, target: dict[str, Any]) -> None:
+        with self._lock:
+            # Preserve the snapshot for multi-command tools, even if another
+            # request selects a different process while this operation runs.
+            config.target_session = target["session"]
+            config.target_process = dict(target)
+            if (self.config.target_session is None and
+                    (self.config.host, self.config.port, self.config.adb_serial) ==
+                    (config.host, config.port, config.adb_serial)):
+                self.config = replace(self.config, target_session=target["session"], target_process=dict(target))
 
     def _info(self, config: ConnectionConfig | None = None) -> dict[str, Any]:
         config = config or getattr(self._call_context, "config", self.config)
@@ -1773,6 +1850,7 @@ class ToolDispatcher:
             "timeout": config.timeout,
             "auto_adb_forward": config.auto_adb_forward,
             "adb_serial": config.adb_serial,
+            "target_process": config.target_process,
         }
 
     def call(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -1780,6 +1858,9 @@ class ToolDispatcher:
             "ping": self.ping,
             "connection_info": self.connection_info,
             "configure_connection": self.configure_connection,
+            "process_list": self.process_list,
+            "process_select": self.process_select,
+            "process_current": self.process_current,
             "get_clipboard": self.get_clipboard,
             "show_input_box": self.show_input_box,
             "wait_input": self.wait_input,
@@ -1888,7 +1969,11 @@ class ToolDispatcher:
             self._call_context.config = replace(self.config)
         try:
             self._notify_mcp_call(name, arguments)
-            return method(arguments)
+            result = method(arguments)
+            target = self._call_context.config.target_process
+            if target and name not in {"process_list", "configure_connection", "connection_info"}:
+                result.setdefault("target_process", dict(target))
+            return result
         finally:
             if previous is None:
                 del self._call_context.config
@@ -1991,7 +2076,7 @@ class ToolDispatcher:
         return self._json_call(command)
 
     def _notify_mcp_call(self, name: str, arguments: dict[str, Any]) -> None:
-        if name in {"connection_info", "configure_connection", "mcp_toast_set_enabled", "mcp_toast_show"}:
+        if name in {"connection_info", "configure_connection", "process_list", "process_select", "process_current", "mcp_toast_set_enabled", "mcp_toast_show"}:
             return
         message = json.dumps(
             {"tool": name, "arguments": arguments},
@@ -2015,19 +2100,59 @@ class ToolDispatcher:
     def connection_info(self, _: dict[str, Any]) -> dict[str, Any]:
         return self._info()
 
+    def process_list(self, _: dict[str, Any]) -> dict[str, Any]:
+        # Discovery remains available when a previously selected process died.
+        response = self._client().call("MCP_TARGETS")
+        try:
+            result = json.loads(response)
+        except (ValueError, TypeError) as exc:
+            raise BridgeError("invalid process registry response; module 2.6.2+ required") from exc
+        if not isinstance(result, dict) or result.get("protocol") != 1 or not isinstance(result.get("processes"), list):
+            raise BridgeError("invalid process registry response")
+        for target in result["processes"]:
+            if (not isinstance(target, dict) or type(target.get("pid")) is not int or target["pid"] <= 1
+                    or not isinstance(target.get("process_name"), str) or not target["process_name"]
+                    or not isinstance(target.get("session"), str) or not target["session"]
+                    or len(target["session"]) > 160
+                    or any(c not in "0123456789abcdef-" for c in target["session"])):
+                raise BridgeError("invalid process registry entry")
+        return result
+
+    def process_select(self, args: dict[str, Any]) -> dict[str, Any]:
+        if not args or set(args) - {"pid", "process_name"}:
+            raise BridgeError("provide pid and/or exact process_name")
+        if "pid" in args and (type(args["pid"]) is not int or not 2 <= args["pid"] <= 2147483647):
+            raise BridgeError("pid must be an integer between 2 and 2147483647")
+        if "process_name" in args and (not isinstance(args["process_name"], str) or not 1 <= len(args["process_name"]) <= 1024):
+            raise BridgeError("process_name must be a non-empty exact name")
+        with self._lock:
+            rows = self.process_list({})["processes"]
+            matches = [row for row in rows if all(row[key] == value for key, value in args.items())]
+            if len(matches) != 1:
+                raise BridgeError("process selection is missing or ambiguous; call process_list and select an exact PID")
+            selected = matches[0]
+            candidate = replace(self.config, target_session=selected["session"], target_process=dict(selected))
+            if HookSocketClient(candidate, route_process=True).call("PING") != "PONG":
+                raise BridgeError("selected process did not answer PING; selection unchanged")
+            self.config = candidate
+            if hasattr(self._call_context, "config"):
+                self._call_context.config = replace(candidate)
+            return {"selected": True, "target_process": dict(selected),
+                    "notice": "Discard addresses and handles from the previous process; its hooks/freezes remain unchanged."}
+
+    def process_current(self, _: dict[str, Any]) -> dict[str, Any]:
+        result = self._json_call("MCP_PROCESS_INFO")
+        target = getattr(self._call_context, "config", self.config).target_process
+        if target:
+            result.update(target)  # Gateway boot-qualified session is authoritative.
+        return result
+
     def configure_connection(self, args: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             return self._configure_connection_locked(args)
 
     def _configure_connection_locked(self, args: dict[str, Any]) -> dict[str, Any]:
-        candidate = ConnectionConfig(
-            host=self.config.host,
-            port=self.config.port,
-            timeout=self.config.timeout,
-            auto_adb_forward=self.config.auto_adb_forward,
-            adb_path=self.config.adb_path,
-            adb_serial=self.config.adb_serial,
-        )
+        candidate = replace(self.config)
         if "host" in args:
             if not isinstance(args["host"], str):
                 raise BridgeError("host must be a string")
@@ -2050,6 +2175,9 @@ class ToolDispatcher:
                 raise BridgeError("adb_serial must be a string or null")
             candidate.adb_serial = None if serial is None or serial.strip() == "" else serial
         candidate.validate()
+        if (candidate.host, candidate.port, candidate.adb_serial) != (self.config.host, self.config.port, self.config.adb_serial):
+            candidate.target_session = None
+            candidate.target_process = None
         self.config = candidate
         return self._info(candidate)
 
@@ -2122,8 +2250,8 @@ class ToolDispatcher:
         if not command:
             raise BridgeError("command is required")
         native_name = command.split(None, 1)[0].upper()
-        if native_name == "MCP_QUERY_V1":
-            raise BridgeError("MCP_QUERY_V1 is an internal envelope; call the IL2CPP metadata tool or its original native command")
+        if native_name in {"MCP_QUERY_V1", "MCP_ROUTE", "MCP_TARGETS", "MCP_TARGET_INFO"}:
+            raise BridgeError(f"{native_name} is an internal envelope; use process_list/process_select or the original native command")
         raw_features = raw_command_features(native_name)
         # Opt-in metadata enrichment must not bypass its feature gate via raw calls.
         if native_name == "DECOMP_DECOMPILE" and command.split()[-1] == "resolve_known":

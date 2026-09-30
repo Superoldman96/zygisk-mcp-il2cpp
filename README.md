@@ -11,7 +11,7 @@ https://ifdian.net/a/__mcp/plan
 
 ## 已实现
 
-- 通过持久目录中的 `apps.txt` 配置多个目标包名，同时匹配应用主进程和 `包名:子进程`。
+- 通过持久目录中的 `apps.txt` 配置多个目标：不带冒号的包名匹配主进程及子进程；带冒号的完整名称仅匹配指定子进程。
 - 通过持久目录中的 `port.txt` 自定义 MCP/命令 Socket 端口，默认 `27184`。
 - 由 Zygisk Root companion 读取配置并通过 IPC 传给目标进程，兼容应用进程无法访问 `/data/adb` 的环境。
 - 全新 KernelSU/Magisk WebUI：添加/移除多个包名、修改端口、连接检测、复制 MCP 配置、一键导出 `MCP.zip`。

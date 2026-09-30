@@ -27,6 +27,9 @@ class LocalNative(socketserver.ThreadingTCPServer):
         class Handler(socketserver.StreamRequestHandler):
             def handle(self):
                 command = self.rfile.readline().decode("utf-8").rstrip("\r\n")
+                if command.startswith("MCP_ROUTE "):
+                    self.wfile.write(b"ERR UNKNOWN_COMMAND\n")
+                    return  # Emulate the legacy native command parser.
                 with self.server.lock:
                     self.server.commands.append(command)
                 try:
